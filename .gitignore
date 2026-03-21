@@ -214,3 +214,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# WandB
+wandb/
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake

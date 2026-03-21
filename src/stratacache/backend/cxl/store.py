@@ -95,11 +95,13 @@ class CxlMemoryLayer(MemoryLayer):
             finally:
                 self._cxl.close(hnd)
 
-    def put(self, artifact_id: ArtifactId, payload: bytes, meta: ArtifactMeta) -> None:
+    def put(self, artifact_id: ArtifactId, payload: bytes, meta: ArtifactMeta) -> int:
         name = self._cxl_name(artifact_id)
         record = encode_record(payload, meta)
         actual_size = len(record)
         alloc_size = _align_up(actual_size, self._cfg.alloc_align)
+        
+        released_size = 0
 
         with self._lock:
             # v0.1 behavior: overwrite by best-effort delete then create.
@@ -109,6 +111,12 @@ class CxlMemoryLayer(MemoryLayer):
                 old = None
             if old is not None:
                 try:
+                    # Get replacement size delta from old object to accumulate release size.
+                    obj = old.obj.contents
+                    old_alloc_size = int(getattr(obj, "alloc_size", 0))
+                    if old_alloc_size > 0:
+                        released_size += old_alloc_size
+
                     self._cxl.destroy(old)
                 finally:
                     self._cxl.close(old)
@@ -121,16 +129,24 @@ class CxlMemoryLayer(MemoryLayer):
                 self._cxl.close(hnd)
 
             self._bytes_used += alloc_size
+            self._bytes_used -= released_size
+        return released_size
+            
 
-    def delete(self, artifact_id: ArtifactId) -> None:
+    def delete(self, artifact_id: ArtifactId) -> int:
         name = self._cxl_name(artifact_id)
         with self._lock:
             try:
                 hnd = self._cxl.open(name)
             except KeyError:
-                return
+                return 0
             try:
+                # Get size from object to accumulate release size.
+                obj = hnd.obj.contents
+                alloc_size = int(getattr(obj, "alloc_size", 0))
                 self._cxl.destroy(hnd)
+                self._bytes_used -= alloc_size if alloc_size > 0 else 0
+                return alloc_size
             finally:
                 self._cxl.close(hnd)
 

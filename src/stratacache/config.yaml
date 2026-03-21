@@ -14,3 +14,5 @@ stratacache:
     debug: false
     cxl_dax_device: null
     cxl_reset_metadata: false
+  telemetry:
+    export: true
