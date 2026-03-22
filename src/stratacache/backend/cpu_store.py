@@ -9,7 +9,6 @@ from stratacache.backend.base import BackendStats, MemoryLayer
 from stratacache.core.artifact import ArtifactId, ArtifactMeta
 from stratacache.core.errors import ArtifactNotFound
 
-
 @dataclass(slots=True)
 class _Entry:
     payload: bytes
@@ -53,26 +52,38 @@ class CpuMemoryLayer(MemoryLayer):
             self._lru.move_to_end(k, last=True)
             return ent.payload, ent.meta
 
-    def put(self, artifact_id: ArtifactId, payload: bytes, meta: ArtifactMeta) -> None:
+    def put(self, artifact_id: ArtifactId, payload: bytes, meta: ArtifactMeta) -> int:
         k = str(artifact_id)
         with self._lock:
+            released_size = 0
+            
+            # Handle replacement of existing entry
             old = self._lru.get(k)
+            old_size = 0
             if old is not None:
+                old_size = old.size
                 self._bytes_used -= old.size
                 self._lru.pop(k, None)
 
+            # Add new entry
             ent = _Entry(payload=payload, meta=meta)
             self._lru[k] = ent
             self._bytes_used += ent.size
             self._lru.move_to_end(k, last=True)
-            self._evict_if_needed()
+            
+            # Calculate net released: replaced size - new size + evicted size
+            evicted_size = self._evict_if_needed()
 
-    def delete(self, artifact_id: ArtifactId) -> None:
+            return old_size + evicted_size
+
+    def delete(self, artifact_id: ArtifactId) -> int:
         k = str(artifact_id)
         with self._lock:
             ent = self._lru.pop(k, None)
             if ent is not None:
                 self._bytes_used -= ent.size
+                return ent.size
+            return 0
 
     def stats(self) -> BackendStats:
         with self._lock:
@@ -82,12 +93,17 @@ class CpuMemoryLayer(MemoryLayer):
                 bytes_capacity=self._capacity_bytes,
             )
 
-    def _evict_if_needed(self) -> None:
+    def _evict_if_needed(self) -> int:
         if self._capacity_bytes is None:
-            return
+            return 0
+        
+        released_size = 0
         while self._bytes_used > self._capacity_bytes and self._lru:
             _, ent = self._lru.popitem(last=False)  # least-recently used
+            released_size += ent.size
             self._bytes_used -= ent.size
+        
+        return released_size
 
 
 # Backward-compatible alias (v0.1)

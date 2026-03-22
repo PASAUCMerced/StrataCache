@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stratacache"
-version = "0.1.0"
+version = "0.2.0"
 description = "Standalone tiered artifact cache with CPU+CXL backends and write-through/write-back links."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -13,6 +13,8 @@ authors = [{ name = "StrataCache Contributors" }]
 dependencies = [
     "PyYAML>=6.0",
     "vllm==0.13.0",
+    "psutil>=5.9.0",
+    "wandb>=0.15.0",
 ]
 
 [tool.setuptools]

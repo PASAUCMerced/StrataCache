@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
-from typing import Optional, Sequence
+from typing import Optional, Sequence, Tuple
 
 from stratacache.backend.base import MemoryLayer
 from stratacache.core.artifact import ArtifactId, ArtifactMeta
@@ -10,6 +10,9 @@ from stratacache.core.errors import ArtifactNotFound
 from stratacache.tiering.policy import LinkPolicy, StoreReason
 from stratacache.writeback.manager import WritebackManager
 
+from stratacache.telemetry.telemetry import StrataTelemetry, StrataTierType
+
+import time
 
 @dataclass(frozen=True, slots=True)
 class FetchResult:
@@ -47,6 +50,9 @@ class TierChain:
             flush_hop=self._flush_hop,
             enable_worker=enable_writeback_worker,
         )
+        
+        self._telemetry = StrataTelemetry.get_or_create()
+
 
     @property
     def tiers(self) -> list[MemoryLayer]:
@@ -62,6 +68,17 @@ class TierChain:
 
     def close(self) -> None:
         self._wb.stop()
+        
+    def _resolve_tier_type(self, tier: int | str) -> StrataTierType:
+        if tier == 0 or tier == "cpu":
+            return StrataTierType.CPU
+        if tier == 1 or tier == "cxl":
+            return StrataTierType.CXL
+        if tier == 2 or tier == "nixl":
+            return StrataTierType.NIXL
+        if tier == 3 or tier == "disk":
+            return StrataTierType.DISK
+        return StrataTierType.UNKNOWN
 
     def _resolve_tier_index(self, tier: int | str) -> int:
         if isinstance(tier, int):
@@ -103,8 +120,8 @@ class TierChain:
         """
         with self._lock:
             for i, b in enumerate(self._tiers):
-                try:
-                    payload, meta = b.get(artifact_id)
+                try:                    
+                    payload, meta = self.tier_get_telemetry_wrap(i, b.get, artifact_id)
                 except ArtifactNotFound:
                     continue
 
@@ -117,11 +134,35 @@ class TierChain:
     def fetch_from(self, tier: int | str, artifact_id: ArtifactId, *, promote: bool = False) -> FetchResult:
         idx = self._resolve_tier_index(tier)
         with self._lock:
-            payload, meta = self._tiers[idx].get(artifact_id)
+            payload, meta = self.tier_get_telemetry_wrap(idx, self._tiers[idx].get, artifact_id)
             if promote and idx > 0:
                 for up in range(0, idx):
                     self._put_direct(up, artifact_id, payload, meta, reason=StoreReason.PROMOTION)
             return FetchResult(payload=payload, meta=meta, hit_tier=idx)
+
+    def tier_get_telemetry_wrap(self, tier_index: int, func, *args, **kwargs) -> Tuple[bytes, ArtifactMeta]:
+        """Wrap tier.get() to record telemetry data
+
+        Args:
+            tier_index (int): Tier
+            func (_type_): Tier get function call
+
+        Returns:
+            Tuple[bytes, ArtifactMeta]: payload and meta returned by tier.get()
+        """
+        
+        start_time = time.perf_counter()
+        payload, meta = func(*args, **kwargs)
+        end_time = time.perf_counter()
+        tier_bytes_used = self._tiers[tier_index].stats().bytes_used
+        self._telemetry.on_tier_op_async(
+            tier=self._resolve_tier_type(tier_index),
+            op_type="load",
+            latency_us=(end_time - start_time) * 1_000_000,
+            size=len(payload),
+            tier_bytes_used=tier_bytes_used,
+        )
+        return payload, meta
 
     def store(self, artifact_id: ArtifactId, payload: bytes, meta: ArtifactMeta) -> None:
         """
@@ -154,8 +195,8 @@ class TierChain:
 
     def delete(self, artifact_id: ArtifactId) -> None:
         with self._lock:
-            for b in self._tiers:
-                b.delete(artifact_id)
+            for i, b in enumerate(self._tiers):
+                self.tier_delete_telemetry_wrap(i, b.delete, artifact_id)
             # Clear dirty markers for all possible upper tiers.
             for upper in range(len(self._links)):
                 self._wb.clear_dirty(upper, artifact_id)
@@ -163,12 +204,31 @@ class TierChain:
     def delete_from(self, tier: int | str, artifact_id: ArtifactId) -> None:
         idx = self._resolve_tier_index(tier)
         with self._lock:
-            self._tiers[idx].delete(artifact_id)
+            self.tier_delete_telemetry_wrap(idx, self._tiers[idx].delete, artifact_id)
             upper = idx
             if upper < len(self._links):
                 self._wb.clear_dirty(upper, artifact_id)
             if upper > 0:
                 self._wb.clear_dirty(upper - 1, artifact_id)
+                
+    def tier_delete_telemetry_wrap(self, tier_index: int, func, *args, **kwargs) -> None:
+        """Wrap tier.delete() to record telemetry data.
+
+        Args:
+            tier_index (int): Tier
+            func (_type_): Tier delete function call
+        """
+        start_time = time.perf_counter()
+        released_size = func(*args, **kwargs)
+        end_time = time.perf_counter()
+        tier_bytes_used = self._tiers[tier_index].stats().bytes_used
+        self._telemetry.on_tier_op_async(
+            tier=self._resolve_tier_type(tier_index),
+            op_type="delete",
+            latency_us=(end_time - start_time) * 1_000_000,
+            size=released_size,
+            tier_bytes_used=tier_bytes_used,
+        )
 
     def flush(self, artifact_id: Optional[ArtifactId] = None, *, max_items: Optional[int] = None) -> int:
         """
@@ -200,10 +260,30 @@ class TierChain:
         *,
         reason: StoreReason,
     ) -> None:
-        # Direct backend write; does not apply chain semantics automatically.
-        self._tiers[tier_index].put(artifact_id, payload, meta)
+        self.tier_put_telemetry_wrap(tier_index, self._tiers[tier_index].put, artifact_id, payload, meta)
         # Promotions / flush writes should not mark dirty for upper tiers above them.
         _ = reason
+        
+    def tier_put_telemetry_wrap(self, tier_index: int, func, *args, **kwargs) -> None:
+        """Wrap tier.put() to record telemetry data.
+
+        Args:
+            tier_index (int): Tier
+            func (_type_): Tier put function call
+        """
+        start_time = time.perf_counter()
+        released_size = func(*args, **kwargs)
+        end_time = time.perf_counter()
+        payload_size = len(args[1]) if len(args) > 1 else 0  # payload is the second arg
+        tier_bytes_used = self._tiers[tier_index].stats().bytes_used
+        self._telemetry.on_tier_op_async(
+            tier=self._resolve_tier_type(tier_index),
+            op_type="store",
+            latency_us=(end_time - start_time) * 1_000_000,
+            size=payload_size,
+            released_size=released_size,  # Report released block size
+            tier_bytes_used=tier_bytes_used,
+        )
 
     def _propagate_after_write(
         self,
@@ -249,7 +329,7 @@ class TierChain:
 
             # If artifact is missing from upper tier, treat as clean (nothing to flush).
             try:
-                payload, meta = self._tiers[upper_tier].get(artifact_id)
+                payload, meta = self.tier_get_telemetry_wrap(upper_tier, self._tiers[upper_tier].get, artifact_id)
             except ArtifactNotFound:
                 self._wb.clear_dirty(upper_tier, artifact_id)
                 return

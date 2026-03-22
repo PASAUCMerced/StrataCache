@@ -1,6 +1,7 @@
 README.md
 pyproject.toml
 src/stratacache/__init__.py
+src/stratacache/config.py
 src/stratacache/config.yaml
 src/stratacache.egg-info/PKG-INFO
 src/stratacache.egg-info/SOURCES.txt
@@ -30,6 +31,12 @@ src/stratacache/engine/storage_engine.py
 src/stratacache/engine/types.py
 src/stratacache/migration/__init__.py
 src/stratacache/migration/planner.py
+src/stratacache/telemetry/__init__.py
+src/stratacache/telemetry/exporters.py
+src/stratacache/telemetry/telemetry.py
+src/stratacache/telemetry/utils.py
+src/stratacache/telemetry/backend/__init__.py
+src/stratacache/telemetry/backend/cpu_telemetry.py
 src/stratacache/tiering/__init__.py
 src/stratacache/tiering/chain.py
 src/stratacache/tiering/policy.py

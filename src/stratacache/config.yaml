@@ -14,3 +14,12 @@ stratacache:
     debug: false
     cxl_dax_device: null
     cxl_reset_metadata: false
+  exporter:
+    wandb:
+      enabled: false
+      entity: ""
+      project: stratacache
+      run_name: default-run
+    file:
+      enabled: false
+      folder: "/tmp/stratacache-exports"
