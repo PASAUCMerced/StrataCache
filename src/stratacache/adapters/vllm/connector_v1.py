@@ -1256,7 +1256,7 @@ class _StrataConnectorImpl:
                 # vLLM passes `num_external_tokens_to_load` as "additional tokens
                 # to load beyond `num_computed_tokens_before_step`". Convert to a
                 # total cached prefix length so the worker can skip what vLLM already has.
-                vllm_cached = min(len(prompt_token_ids), max(0, int(num_computed_tokens_before_step)))
+                vllm_cached = min(len(prompt_token_ids), max(0, int(num_computed_tokens_before_step) - int(num_external_tokens_to_load)))
                 cached_total = vllm_cached + max(0, int(num_external_tokens_to_load))
                 cached_total = min(int(cached_total), len(prompt_token_ids))
                 load_ends = list(range(cs, (cached_total // cs) * cs + 1, cs))
