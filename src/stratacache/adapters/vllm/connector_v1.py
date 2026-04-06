@@ -1261,7 +1261,16 @@ class _StrataConnectorImpl:
                 cached_total = min(int(cached_total), len(prompt_token_ids))
                 load_ends = list(range(cs, (cached_total // cs) * cs + 1, cs))
                 if self._save_partial_chunks and (cached_total % cs != 0) and cached_total > 0:
-                    load_ends.append(int(cached_total))
+                    # get_num_new_matched_tokens subtracts 1 from a full-prompt hit to force
+                    # logit recompute (e.g. cached_total=15159 but stored boundary is 15160=n).
+                    # If cached_total+1 is a valid stored boundary (chunk-aligned or == n),
+                    # use it so the worker fetches the artifact that was actually written.
+                    n_prompt = len(prompt_token_ids)
+                    candidate = int(cached_total)
+                    if (candidate + 1) % cs == 0 or (candidate + 1) == n_prompt:
+                        candidate = candidate + 1
+                        cached_total = candidate  # keep tokens_to_load consistent with load_ends
+                    load_ends.append(candidate)
             else:
                 vllm_cached = 0
                 cached_total = 0
