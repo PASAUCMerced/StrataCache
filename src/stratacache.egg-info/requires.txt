@@ -1,5 +1,5 @@
 PyYAML>=6.0
-vllm==0.13.0
+vllm
 psutil>=5.9.0
 wandb>=0.15.0
 pybind11>=2.6.0
