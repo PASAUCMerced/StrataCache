@@ -25,9 +25,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-from stratacache.backend.cpu_store import CpuMemoryLayer
+from stratacache.backend.cpu import CpuMemoryLayer
 from stratacache.core.artifact import ArtifactId, ArtifactMeta, ArtifactType
 from stratacache.core.errors import ArtifactNotFound
+from stratacache.core.memory_obj import BytesMemoryObj
 from stratacache.engine.storage_engine import StorageEngine
 from stratacache.tiering.chain import TierChain
 from stratacache.tiering.policy import LinkPolicy
@@ -1568,7 +1569,7 @@ class _StrataConnectorImpl:
                         fr = self._engine.load(aid, promote=False)
                         _prof_record("worker.start_load_kv.bundle.fetch", time.perf_counter() - t_fetch0)
                         t_dec0 = time.perf_counter()
-                        stacked = self._decode_tensor(fr.payload, device=layer_items[0][1].device, meta=fr.meta)
+                        stacked = self._decode_tensor(fr.memory_obj.byte_array, device=layer_items[0][1].device, meta=fr.memory_obj.metadata.artifact_meta)
                         _prof_record("worker.start_load_kv.bundleT.decode_tensor", time.perf_counter() - t_dec0)
                     except ArtifactNotFound:
                         fr = None  # type: ignore[assignment]
@@ -1581,7 +1582,7 @@ class _StrataConnectorImpl:
                         try:
                             fr = self._engine.load(self._chunk_bundle_id(pref, end), promote=False)
                             t_dec0 = time.perf_counter()
-                            bundle = _decode_bundle(fr.payload)
+                            bundle = _decode_bundle(fr.memory_obj.byte_array)
                             _prof_record("worker.start_load_kv.bundle.decode_bundle", time.perf_counter() - t_dec0)
                             # Scatter available layers (old bundle: per-layer bytes).
                             tier = self._tier_names[fr.hit_tier]
@@ -1600,8 +1601,8 @@ class _StrataConnectorImpl:
                                     break
                             # Attribute one chunk
                             self._stats["loaded_chunks"] += 1
-                            self._stats["bytes_loaded"] += len(fr.payload)
-                            self._io_by_tier[tier]["bytes_loaded"] += len(fr.payload)
+                            self._stats["bytes_loaded"] += len(fr.memory_obj.byte_array)
+                            self._io_by_tier[tier]["bytes_loaded"] += len(fr.memory_obj.byte_array)
                             self._io_by_tier[tier]["chunks_loaded"] += 1
                             dt = int(end - chunk_start)
                             loaded_tokens_for_req += dt
@@ -1618,7 +1619,7 @@ class _StrataConnectorImpl:
                                 lfr = self._engine.load(laid, promote=False)
                             except ArtifactNotFound:
                                 break
-                            gathered = self._decode_tensor(lfr.payload, device=kv_layer.device, meta=lfr.meta)
+                            gathered = self._decode_tensor(lfr.memory_obj.byte_array, device=kv_layer.device, meta=lfr.memory_obj.metadata.artifact_meta)
                             try:
                                 _scatter_by_slots(kv_layer, sm_slice, gathered)
                             except RuntimeError:
@@ -1628,8 +1629,8 @@ class _StrataConnectorImpl:
                             l0 = self._engine.load(self._chunk_layer_id(pref, end, 0), promote=False)
                             tier = self._tier_names[l0.hit_tier]
                             self._stats["loaded_chunks"] += 1
-                            self._stats["bytes_loaded"] += len(l0.payload)
-                            self._io_by_tier[tier]["bytes_loaded"] += len(l0.payload)
+                            self._stats["bytes_loaded"] += len(l0.memory_obj.byte_array)
+                            self._io_by_tier[tier]["bytes_loaded"] += len(l0.memory_obj.byte_array)
                             self._io_by_tier[tier]["chunks_loaded"] += 1
                             dt = int(end - chunk_start)
                             loaded_tokens_for_req += dt
@@ -1653,8 +1654,8 @@ class _StrataConnectorImpl:
                             break
                     # Attribution: count one "loaded chunk" per chunk (not per layer)
                     self._stats["loaded_chunks"] += 1
-                    self._stats["bytes_loaded"] += len(fr.payload)
-                    self._io_by_tier[tier]["bytes_loaded"] += len(fr.payload)
+                    self._stats["bytes_loaded"] += len(fr.memory_obj.byte_array)
+                    self._io_by_tier[tier]["bytes_loaded"] += len(fr.memory_obj.byte_array)
                     self._io_by_tier[tier]["chunks_loaded"] += 1
                     dt = int(end - chunk_start)
                     loaded_tokens_for_req += dt
@@ -1678,15 +1679,15 @@ class _StrataConnectorImpl:
                                 fr = self._engine.load(aid, promote=False)
                             except ArtifactNotFound:
                                 break
-                            gathered = self._decode_tensor(fr.payload, device=kv_layer.device, meta=fr.meta)
+                            gathered = self._decode_tensor(fr.memory_obj.byte_array, device=kv_layer.device, meta=fr.memory_obj.metadata.artifact_meta)
                             try:
                                 _scatter_by_slots(kv_layer, sm_slice, gathered)
                             except RuntimeError:
                                 break
                             self._stats["loaded_chunks"] += 1
-                            self._stats["bytes_loaded"] += len(fr.payload)
+                            self._stats["bytes_loaded"] += len(fr.memory_obj.byte_array)
                             tier = self._tier_names[fr.hit_tier]
-                            self._io_by_tier[tier]["bytes_loaded"] += len(fr.payload)
+                            self._io_by_tier[tier]["bytes_loaded"] += len(fr.memory_obj.byte_array)
                             self._io_by_tier[tier]["chunks_loaded"] += 1
                             if layer_idx == 0:
                                 dt = int(end - chunk_start)
@@ -1708,15 +1709,15 @@ class _StrataConnectorImpl:
                                 fr = self._engine.load(aid, promote=False)
                             except ArtifactNotFound:
                                 break
-                            gathered = self._decode_tensor(fr.payload, device=kv_layer.device, meta=fr.meta)
+                            gathered = self._decode_tensor(fr.memory_obj.byte_array, device=kv_layer.device, meta=fr.memory_obj.metadata.artifact_meta)
                             try:
                                 _scatter_by_slots(kv_layer, sm_slice, gathered)
                             except RuntimeError:
                                 break
                             self._stats["loaded_chunks"] += 1
-                            self._stats["bytes_loaded"] += len(fr.payload)
+                            self._stats["bytes_loaded"] += len(fr.memory_obj.byte_array)
                             tier = self._tier_names[fr.hit_tier]
-                            self._io_by_tier[tier]["bytes_loaded"] += len(fr.payload)
+                            self._io_by_tier[tier]["bytes_loaded"] += len(fr.memory_obj.byte_array)
                             self._io_by_tier[tier]["chunks_loaded"] += 1
                             if layer_idx == 0:
                                 dt = int(end - chunk_start)
@@ -1845,8 +1846,10 @@ class _StrataConnectorImpl:
                 attrs.update(tattrs)
                 self._engine.store(
                     self._chunk_layer_id(pref, end, idx),
-                    payload,
-                    ArtifactMeta(artifact_type=ArtifactType.KV_BLOCKS, attrs=attrs),
+                    BytesMemoryObj(
+                        payload,
+                        ArtifactMeta(artifact_type=ArtifactType.KV_BLOCKS, attrs=attrs),
+                    ),
                 )
                 self._stats["stored_chunks"] += 1
                 self._stats["bytes_stored"] += len(payload)
@@ -1868,8 +1871,13 @@ class _StrataConnectorImpl:
                 if idx == 0:
                     self._engine.store(
                         self._chunk_manifest_id(pref, end),
-                        b"",
-                        ArtifactMeta(artifact_type=ArtifactType.KV_BLOCKS, attrs={"tokens": end}),
+                        BytesMemoryObj(
+                            b"",
+                            ArtifactMeta(
+                                artifact_type=ArtifactType.KV_BLOCKS,
+                                attrs={"tokens": end},
+                            ),
+                        ),
                     )
                     # Internal write-back control: not part of StorageEngine public API.
                     self._engine.chain.flush(self._chunk_manifest_id(pref, end))
@@ -1991,10 +1999,12 @@ class _StrataConnectorImpl:
             attrs.update(tattrs)
             self._engine.store(
                 self._chunk_bundle_tensor_id(pref, int(end)),
-                payload,
-                ArtifactMeta(
-                    artifact_type=ArtifactType.KV_BLOCKS,
-                    attrs=attrs,
+                BytesMemoryObj(
+                    payload,
+                    ArtifactMeta(
+                        artifact_type=ArtifactType.KV_BLOCKS,
+                        attrs=attrs,
+                    ),
                 ),
             )
             _prof_record("worker.wait_for_save.bundleT.store", time.perf_counter() - t_s0)

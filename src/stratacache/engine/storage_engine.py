@@ -3,8 +3,9 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from stratacache.backend.base import MemoryLayer
-from stratacache.core.artifact import ArtifactId, ArtifactMeta
+from stratacache.core.artifact import ArtifactId
 from stratacache.core.errors import ArtifactNotFound
+from stratacache.core.memory_obj import MemoryObj
 from stratacache.engine.types import AccessMode, ContainsResult, LoadResult
 from stratacache.tiering.chain import TierChain
 from stratacache.tiering.policy import LinkPolicy
@@ -15,7 +16,8 @@ class StorageEngine:
     Public storage facade used by adapters and direct clients.
 
     It exposes a small, stable API (`store/load/contains/delete`) and hides
-    tier traversal details behind `AccessMode`.
+    tier traversal details behind `AccessMode`. Payloads at this boundary
+    are MemoryObj.
     """
 
     def __init__(self, chain: TierChain) -> None:
@@ -29,7 +31,6 @@ class StorageEngine:
         links: Sequence[LinkPolicy],
         enable_writeback_worker: bool = True,
     ) -> "StorageEngine":
-        """Build an engine directly from memory layers and link policies."""
         chain = TierChain(
             tiers=tiers,
             links=links,
@@ -47,41 +48,32 @@ class StorageEngine:
         return self._chain
 
     def close(self) -> None:
-        """Stop background workers and release chain resources."""
         self._chain.close()
 
     def store(
         self,
         artifact_id: ArtifactId,
-        payload: bytes,
-        meta: ArtifactMeta,
+        memory_obj: MemoryObj,
         *,
         medium: int | str | None = None,
         mode: AccessMode | str = AccessMode.CHAIN,
     ) -> None:
-        """
-        Store an artifact.
-
-        - `medium=None`: write through the chain head.
-        - `mode=exact` with `medium`: write only to that tier.
-        - `mode=chain` with `medium`: write at that tier and propagate downstream.
-        """
         m = _normalize_mode(mode)
         if medium is None:
-            self._chain.store(artifact_id, payload, meta)
+            self._chain.store(artifact_id, memory_obj)
             return
 
         if m == AccessMode.CHAIN:
-            self._chain.store_at(medium, artifact_id, payload, meta, propagate=True)
+            self._chain.store_at(medium, artifact_id, memory_obj, propagate=True)
             return
         if m == AccessMode.EXACT:
-            self._chain.store_at(medium, artifact_id, payload, meta, propagate=False)
+            self._chain.store_at(medium, artifact_id, memory_obj, propagate=False)
             return
         if m == AccessMode.PREFER:
             try:
-                self._chain.store_at(medium, artifact_id, payload, meta, propagate=False)
+                self._chain.store_at(medium, artifact_id, memory_obj, propagate=False)
             except ValueError:
-                self._chain.store(artifact_id, payload, meta)
+                self._chain.store(artifact_id, memory_obj)
             return
         raise ValueError(f"unknown mode: {mode}")
 
@@ -93,20 +85,12 @@ class StorageEngine:
         mode: AccessMode | str = AccessMode.CHAIN,
         promote: bool = True,
     ) -> LoadResult:
-        """
-        Load an artifact with tier selection behavior controlled by `mode`.
-
-        - `chain`: normal top-down lookup.
-        - `exact`: only read from `medium`.
-        - `prefer`: try `medium`, fallback to chain lookup.
-        """
         m = _normalize_mode(mode)
 
         if medium is None or m == AccessMode.CHAIN:
             fr = self._chain.fetch(artifact_id, promote=promote)
             return LoadResult(
-                payload=fr.payload,
-                meta=fr.meta,
+                memory_obj=fr.memory_obj,
                 hit_tier=fr.hit_tier,
                 hit_medium=self._chain.tier_names[fr.hit_tier],
             )
@@ -114,8 +98,7 @@ class StorageEngine:
         if m == AccessMode.EXACT:
             fr = self._chain.fetch_from(medium, artifact_id, promote=promote)
             return LoadResult(
-                payload=fr.payload,
-                meta=fr.meta,
+                memory_obj=fr.memory_obj,
                 hit_tier=fr.hit_tier,
                 hit_medium=self._chain.tier_names[fr.hit_tier],
             )
@@ -126,8 +109,7 @@ class StorageEngine:
             except (ArtifactNotFound, ValueError):
                 fr = self._chain.fetch(artifact_id, promote=promote)
             return LoadResult(
-                payload=fr.payload,
-                meta=fr.meta,
+                memory_obj=fr.memory_obj,
                 hit_tier=fr.hit_tier,
                 hit_medium=self._chain.tier_names[fr.hit_tier],
             )
@@ -141,7 +123,6 @@ class StorageEngine:
         medium: int | str | None = None,
         mode: AccessMode | str = AccessMode.CHAIN,
     ) -> ContainsResult:
-        """Check existence and return where the artifact was found."""
         m = _normalize_mode(mode)
 
         if medium is None or m == AccessMode.CHAIN:
@@ -162,7 +143,9 @@ class StorageEngine:
             if not ok:
                 return ContainsResult(exists=False, hit_tier=None, hit_medium=None)
             idx = _resolve_tier(self._chain, medium)
-            return ContainsResult(exists=True, hit_tier=idx, hit_medium=self._chain.tier_names[idx])
+            return ContainsResult(
+                exists=True, hit_tier=idx, hit_medium=self._chain.tier_names[idx]
+            )
 
         if m == AccessMode.PREFER:
             try:
@@ -179,12 +162,13 @@ class StorageEngine:
             hit = self._chain.exists(artifact_id)
             if hit is None:
                 return ContainsResult(exists=False, hit_tier=None, hit_medium=None)
-            return ContainsResult(exists=True, hit_tier=hit, hit_medium=self._chain.tier_names[hit])
+            return ContainsResult(
+                exists=True, hit_tier=hit, hit_medium=self._chain.tier_names[hit]
+            )
 
         raise ValueError(f"unknown mode: {mode}")
 
     def delete(self, artifact_id: ArtifactId, *, medium: int | str | None = None) -> None:
-        """Delete from one tier (`medium`) or all tiers (`medium=None`)."""
         if medium is None:
             self._chain.delete(artifact_id)
             return

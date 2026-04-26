@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from stratacache.core.key_builder import build_kv_chunk_id, build_param_chunk_id
+from stratacache.artifacts.kv import build_kv_chunk_id
+from stratacache.artifacts.params import build_param_chunk_id
 
 
 def run() -> None:

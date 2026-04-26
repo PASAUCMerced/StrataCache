@@ -8,10 +8,10 @@ def run() -> None:
         # Optional test: only runs when torch is installed.
         return
 
-    from stratacache.backend.cpu_store import CpuMemoryLayer
-    from stratacache.core.artifact import ArtifactMeta, ArtifactType
+    from stratacache.backend.cpu import CpuMemoryLayer
+    from stratacache.core.artifact import ArtifactId, ArtifactMeta, ArtifactType
+    from stratacache.core.memory_obj import BytesMemoryObj
     from stratacache.tiering.chain import TierChain
-    from stratacache.tiering.policy import LinkPolicy
     from stratacache.adapters.vllm.connector_v1 import (
         _decode_tensor_stable,
         _encode_tensor_stable,
@@ -26,12 +26,11 @@ def run() -> None:
         gathered = _gather_by_slots(kv, slots).cpu()
         payload = _encode_tensor_stable(gathered)
 
-        aid = "test:kv:layer0"
-        from stratacache.core.artifact import ArtifactId
-
-        chain.store(ArtifactId(aid), payload, ArtifactMeta(artifact_type=ArtifactType.KV_BLOCKS))
-        fr = chain.fetch(ArtifactId(aid), promote=False)
-        out_payload = fr.payload
+        aid = ArtifactId("test:kv:layer0")
+        meta = ArtifactMeta(artifact_type=ArtifactType.KV_BLOCKS)
+        chain.store(aid, BytesMemoryObj(payload, meta))
+        fr = chain.fetch(aid, promote=False)
+        out_payload = fr.memory_obj.byte_array
         out = _decode_tensor_stable(out_payload, device=torch.device("cpu"))
 
         kv2 = torch.zeros_like(kv)
@@ -41,4 +40,3 @@ def run() -> None:
         assert torch.allclose(flat1[:, slots], flat2[:, slots])
     finally:
         chain.close()
-

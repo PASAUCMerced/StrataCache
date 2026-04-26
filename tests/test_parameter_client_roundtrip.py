@@ -8,9 +8,8 @@ def run() -> None:
         return
 
     from stratacache.adapters.torch.parameter_client import ParameterStoreClient
-    from stratacache.backend.cpu_store import CpuMemoryLayer
+    from stratacache.backend.cpu import CpuMemoryLayer
     from stratacache.engine import AccessMode, StorageEngine
-    from stratacache.tiering.policy import LinkPolicy
 
     eng = StorageEngine.from_tiers(
         tiers=[CpuMemoryLayer(store_name="cpu")],

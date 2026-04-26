@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from stratacache.backend.cpu_store import CpuMemoryLayer
+from stratacache.backend.cpu import CpuMemoryLayer
 from stratacache.core.artifact import ArtifactId, ArtifactMeta, ArtifactType
+from stratacache.core.memory_obj import BytesMemoryObj
 from stratacache.tiering.chain import TierChain
 from stratacache.tiering.policy import LinkPolicy
 
@@ -13,12 +14,9 @@ def run() -> None:
     try:
         aid = ArtifactId("t:wt")
         meta = ArtifactMeta(artifact_type=ArtifactType.CUSTOM, attrs={"x": 1})
-        chain.store(aid, b"abc", meta)
+        chain.store(aid, BytesMemoryObj(b"abc", meta))
 
-        p0, _ = l0.get(aid)
-        p1, _ = l1.get(aid)
-        assert p0 == b"abc"
-        assert p1 == b"abc"
+        assert l0.get(aid).byte_array == b"abc"
+        assert l1.get(aid).byte_array == b"abc"
     finally:
         chain.close()
-

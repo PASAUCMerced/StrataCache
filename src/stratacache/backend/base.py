@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional
 
-from stratacache.core.artifact import ArtifactId, ArtifactMeta
+from stratacache.core.artifact import ArtifactId
+from stratacache.core.memory_obj import MemoryObj
 
 
 @dataclass(frozen=True, slots=True)
@@ -18,7 +19,10 @@ class MemoryLayer(ABC):
     """
     Minimal memory layer contract.
 
-    v0.1 uses bytes payloads and JSON-like metadata (encoded by the caller).
+    Payload type at this boundary is `MemoryObj` (type-agnostic). The
+    previous v0.1 contract that used raw `bytes` is gone; backends that
+    internally serialize (e.g. CXL) call into the appropriate codec
+    themselves.
     """
 
     @property
@@ -27,48 +31,28 @@ class MemoryLayer(ABC):
 
     @abstractmethod
     def exists(self, artifact_id: ArtifactId) -> bool:
-        """_summary_
-            Check if an artifact exists in the store.
-        Args:
-            artifact_id (ArtifactId): Artifact ID
-        Returns:
-            bool: True if the artifact exists, False otherwise.
+        """Return True iff `artifact_id` is currently stored in this layer."""
+        ...
+
+    @abstractmethod
+    def get(self, artifact_id: ArtifactId) -> MemoryObj:
+        """
+        Retrieve the stored MemoryObj. Raises ArtifactNotFound if absent.
         """
         ...
 
     @abstractmethod
-    def get(self, artifact_id: ArtifactId) -> Tuple[bytes, ArtifactMeta]:
-        """_summary_
-            Get an artifact from the store.
-        Args:
-            artifact_id (ArtifactId): Artifact ID
-        Returns:
-            Tuple[bytes, ArtifactMeta]: A tuple of (payload, metadata)
+    def put(self, artifact_id: ArtifactId, memory_obj: MemoryObj) -> int:
         """
-        ...
-
-    @abstractmethod
-    def put(self, artifact_id: ArtifactId, payload: bytes, meta: ArtifactMeta) -> int:
-        """_summary_
-            Put an artifact into the store. If this operation releases a block, return the size of the released block.
-        Args:
-            artifact_id (ArtifactId): Artifact ID
-            payload (bytes): Data payload
-            meta (ArtifactMeta): Artifact metadata
-        Returns:
-            int: Total released block size. If no block is released, return 0.
+        Store the MemoryObj. Returns the number of bytes that this put
+        released (sum of replaced-key size + LRU-evicted sizes); 0 if
+        nothing was freed.
         """
         ...
 
     @abstractmethod
     def delete(self, artifact_id: ArtifactId) -> int:
-        """_summary_
-            Delete an artifact from the store, and return the released block size.
-        Args:
-            artifact_id (ArtifactId): Artifact ID
-        Returns:
-            int: Released block size.
-        """
+        """Remove the MemoryObj. Returns the bytes released."""
         ...
 
     @abstractmethod
@@ -78,4 +62,3 @@ class MemoryLayer(ABC):
 # Backward-compatible aliases (v0.1)
 StorageBackend = MemoryLayer
 LayerStats = BackendStats
-

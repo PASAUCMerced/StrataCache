@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
-from stratacache.core.artifact import ArtifactMeta
+from stratacache.core.memory_obj import MemoryObj
 
 
 class AccessMode(str, Enum):
@@ -14,8 +14,7 @@ class AccessMode(str, Enum):
 
 @dataclass(frozen=True, slots=True)
 class LoadResult:
-    payload: bytes
-    meta: ArtifactMeta
+    memory_obj: MemoryObj
     hit_tier: int
     hit_medium: str
 

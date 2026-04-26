@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from typing import Any
 
+from stratacache.artifacts.params.key_builder import build_param_chunk_id
 from stratacache.core.artifact import ArtifactId, ArtifactMeta, ArtifactType
-from stratacache.core.key_builder import build_param_chunk_id
+from stratacache.core.memory_obj import BytesMemoryObj
 from stratacache.engine.storage_engine import StorageEngine
 from stratacache.engine.types import AccessMode, ContainsResult
 
@@ -31,10 +32,8 @@ class ParameterStoreClient:
     """
     Thin helper for parameter chunk offload/prefetch on top of StorageEngine.
 
-    It only handles:
-    - key generation
-    - tensor bytes codec
-    - minimal metadata wiring
+    NOTE: this phase keeps the v0.1 bytes-roundtrip path. Zero-copy via
+    TensorMemoryObj is part of the later allocator port (B1/B2/B3).
     """
 
     def __init__(
@@ -101,10 +100,10 @@ class ParameterStoreClient:
         if meta_extra:
             attrs.update(dict(meta_extra))
 
+        meta = ArtifactMeta(artifact_type=ArtifactType.PARAM_CHUNK, attrs=attrs)
         self._engine.store(
             aid,
-            payload,
-            ArtifactMeta(artifact_type=ArtifactType.PARAM_CHUNK, attrs=attrs),
+            BytesMemoryObj(payload, meta),
             medium=medium,
             mode=mode,
         )
@@ -130,9 +129,9 @@ class ParameterStoreClient:
             chunk_idx=chunk_idx,
         )
         lr = self._engine.load(aid, medium=medium, mode=mode, promote=promote)
-        attrs = dict(lr.meta.attrs)
+        attrs = dict(lr.memory_obj.metadata.artifact_meta.attrs)
         return _decode_tensor_raw(
-            lr.payload,
+            lr.memory_obj.byte_array,
             dtype_name=str(attrs.get("tensor_dtype", dtype)),
             shape=attrs.get("tensor_shape", []),
             device=device,
