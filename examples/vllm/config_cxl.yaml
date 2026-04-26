@@ -1,0 +1,17 @@
+# Example StrataCache config: CPU + CXL with write-back, KV events on.
+
+stratacache:
+  connector:
+    chunk_size: 256
+    cpu_capacity_gb: 60
+
+    # use_cxl: true
+    writeback: true
+    # CXL DAX device: a character device path on this host. Adjust to
+    # whatever is present, e.g. /dev/dax0.0 or /dev/dax1.0. Can also be
+    # set via env var: STRATACACHE_CXL_DAX_DEVICE.
+    # cxl_dax_device: /dev/dax1.0
+    cxl_reset_metadata: true
+
+    save_partial_chunks: true
+    expose_kv_events: true

@@ -2,7 +2,7 @@ stratacache:
   connector:
     use_cxl: false
     writeback: false
-    cpu_capacity_mb: 61440
+    cpu_capacity_gb: 60
     chunk_size: 256
     bundle_layers: true
     tensor_codec: stable
@@ -14,5 +14,15 @@ stratacache:
     debug: false
     cxl_dax_device: null
     cxl_reset_metadata: false
+    # Phase-3 toggles.
+    use_pinned_slab: true
+    use_lazy_allocator: false
+    lazy_initial_mb: 0
+    lazy_growth_step_mb: 0
+    use_layerwise_pipeline: false
+    use_token_database: false
+    expose_kv_events: false
+    numa_node: -1
+    reserve_local_cpu_mb: 1024
   telemetry:
     export: true

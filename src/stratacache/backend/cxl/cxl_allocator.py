@@ -42,9 +42,9 @@ class CxlAllocator:
 
     def __init__(self, config: CxlConfig) -> None:
         self._cfg = config
-        # cxl_shm.c reads DAX device from env var; keep ours separate from lmcache.
+        # The C lib reads the DAX device path from this env var.
         if config.dax_device is not None:
-            os.environ["LMCACHE_CXL_DAX_DEVICE"] = config.dax_device
+            os.environ["STRATACACHE_CXL_DAX_DEVICE"] = config.dax_device
         self._cxl = CxlShm(num_procs=config.num_procs, rank=config.rank)
         self._cxl.init()
         if config.reset_metadata_on_init:

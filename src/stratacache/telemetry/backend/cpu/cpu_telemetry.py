@@ -4,12 +4,16 @@ from stratacache.telemetry.telemetry import (
     StrataTierType,
 )
 from stratacache.telemetry.utils import human_readable_size
-import stratacache.pcm as pcm
 
 from dataclasses import dataclass, field
 import threading
 import logging
 import time
+
+try:
+    import stratacache.pcm as pcm  # type: ignore[import-not-found]
+except Exception:  # noqa: BLE001
+    pcm = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +35,16 @@ class StrataCPUTelemetry(StrataTierTelemetry):
         super().__init__(StrataTierType.CPU, telemetry)
         self._stats = StrataCPUStats()
         self._lock = threading.Lock()
+        if pcm is None:
+            logger.info(
+                "stratacache.pcm extension is not built; CPU bandwidth "
+                "metrics disabled. Rebuild with STRATACACHE_BUILD_PCM=1 "
+                "to enable."
+            )
+            self._pcm_collector = None
+            self._mem_bw_matrix = None
+            self._pcie_bw_matrix = None
+            return
         self._pcm_collector = pcm.PCMCollectorHandle()
         self._mem_bw_matrix = self._pcm_collector.get_mem_bandwidth_buffer()
         self._pcie_bw_matrix = self._pcm_collector.get_pcie_bandwidth_buffer()

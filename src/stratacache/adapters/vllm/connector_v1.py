@@ -3,10 +3,7 @@ from __future__ import annotations
 """
 vLLM v0.13.0 connector (KVConnector v1) - StrataCache implementation.
 
-This connector is designed to work similarly to "vLLM + LMCache", but it is
-implemented independently and stores generalized records via StrataCache.
-
-This file intentionally does not import `lmcache`.
+Stores generalized records via StrataCache's tiered storage plane.
 """
 
 import hashlib
@@ -28,7 +25,7 @@ from typing import Any, Optional
 from stratacache.backend.cpu import CpuMemoryLayer
 from stratacache.core.artifact import ArtifactId, ArtifactMeta, ArtifactType
 from stratacache.core.errors import ArtifactNotFound
-from stratacache.core.memory_obj import BytesMemoryObj
+from stratacache.core.memory_obj import BytesMemoryObj, MemoryObj
 from stratacache.engine.storage_engine import StorageEngine
 from stratacache.tiering.chain import TierChain
 from stratacache.tiering.policy import LinkPolicy
@@ -316,7 +313,7 @@ def _chain_key_from_config(cfg: dict[str, Any], vllm_config: Any) -> str:
             "rank": rank,
             "use_cxl": str(cfg.get("use_cxl", False)),
             "writeback": str(cfg.get("writeback", False)),
-            "cpu_cap_mb": str(cfg.get("cpu_capacity_mb", 61440)),
+            "cpu_cap_gb": str(cfg.get("cpu_capacity_gb", 60)),
             "cxl_dax": str(cfg.get("cxl_dax_device", "") or ""),
             "bundle_layers": str(cfg.get("bundle_layers", True)),
         },
@@ -388,7 +385,7 @@ def _parse_int(v: Any, default: int) -> int:
 _CONNECTOR_DEFAULTS: dict[str, Any] = {
     "use_cxl": False,
     "writeback": False,
-    "cpu_capacity_mb": 61440,
+    "cpu_capacity_gb": 60,
     "chunk_size": 256,
     "bundle_layers": True,
     "tensor_codec": "stable",
@@ -400,6 +397,16 @@ _CONNECTOR_DEFAULTS: dict[str, Any] = {
     "log_min_interval_s": 2.0,
     "cxl_dax_device": None,
     "cxl_reset_metadata": False,
+    # ---- Phase 3 features ----
+    "use_pinned_slab": True,          # B1+B2: allocate pinned host slab
+    "use_lazy_allocator": False,      # B5: background-grow the slab
+    "lazy_initial_mb": 0,             # 0 -> auto
+    "lazy_growth_step_mb": 0,         # 0 -> auto
+    "use_layerwise_pipeline": False,  # A1+A2: paged connector + streams
+    "use_token_database": False,      # A4: incremental ChunkedTokenDatabase
+    "expose_kv_events": False,        # A11: surface CacheStore/Remove via get_kv_events
+    "numa_node": -1,                  # B6: -1 = no bind, else node id
+    "reserve_local_cpu_mb": 1024,     # B9: capacity clamp headroom
 }
 
 
@@ -464,7 +471,7 @@ def _load_connector_config(extra: dict[str, Any]) -> dict[str, Any]:
 
     cfg["use_cxl"] = _parse_bool(pick("use_cxl"), bool(cfg["use_cxl"]))
     cfg["writeback"] = _parse_bool(pick("writeback"), bool(cfg["writeback"]))
-    cfg["cpu_capacity_mb"] = _parse_int(pick("cpu_capacity_mb"), int(cfg["cpu_capacity_mb"]))
+    cfg["cpu_capacity_gb"] = _parse_int(pick("cpu_capacity_gb"), int(cfg["cpu_capacity_gb"]))
     cfg["chunk_size"] = _parse_int(pick("chunk_size"), int(cfg["chunk_size"]))
     cfg["bundle_layers"] = _parse_bool(pick("bundle_layers"), bool(cfg["bundle_layers"]))
     cfg["tensor_codec"] = str(pick("tensor_codec") or cfg["tensor_codec"]).lower()
@@ -489,6 +496,17 @@ def _load_connector_config(extra: dict[str, Any]) -> dict[str, Any]:
         pick("cxl_reset_metadata"),
         bool(cfg["cxl_reset_metadata"]),
     )
+
+    # Phase 3 toggles.
+    cfg["use_pinned_slab"] = _parse_bool(pick("use_pinned_slab"), bool(cfg["use_pinned_slab"]))
+    cfg["use_lazy_allocator"] = _parse_bool(pick("use_lazy_allocator"), bool(cfg["use_lazy_allocator"]))
+    cfg["lazy_initial_mb"] = _parse_int(pick("lazy_initial_mb"), int(cfg["lazy_initial_mb"]))
+    cfg["lazy_growth_step_mb"] = _parse_int(pick("lazy_growth_step_mb"), int(cfg["lazy_growth_step_mb"]))
+    cfg["use_layerwise_pipeline"] = _parse_bool(pick("use_layerwise_pipeline"), bool(cfg["use_layerwise_pipeline"]))
+    cfg["use_token_database"] = _parse_bool(pick("use_token_database"), bool(cfg["use_token_database"]))
+    cfg["expose_kv_events"] = _parse_bool(pick("expose_kv_events"), bool(cfg["expose_kv_events"]))
+    cfg["numa_node"] = _parse_int(pick("numa_node"), int(cfg["numa_node"]))
+    cfg["reserve_local_cpu_mb"] = _parse_int(pick("reserve_local_cpu_mb"), int(cfg["reserve_local_cpu_mb"]))
     return cfg
 
 
@@ -520,9 +538,8 @@ def _extract_token_ids(request: Any) -> list[int]:
     """
     vLLM request objects differ across versions/paths.
 
-    Prefer `all_token_ids` (LMCache uses it for preemption robustness and it
-    matches vLLM's internal "tokens in the KV cache"), then fall back to prompt
-    fields.
+    Prefer `prompt_token_ids` for cross-request prefix reuse, then fall
+    back to other token id containers.
     """
     # Prefer prompt_token_ids for cross-request prefix reuse. all_token_ids can
     # include generated tokens for in-flight requests, which breaks prompt-key
@@ -816,6 +833,10 @@ class StrataKVReq:
     # Chunk boundaries that are expected to exist in cache (scheduler computed).
     chunk_ends_to_load: list[int] = field(default_factory=list)
     chunk_ends_to_save: list[int] = field(default_factory=list)
+    # Prefix-hash map computed by the scheduler over `chunk_ends_to_load
+    # ∪ chunk_ends_to_save`. Worker reuses this instead of re-running
+    # SHA256 in start_load_kv / save_kv_layer.
+    ph_map: dict[int, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -844,7 +865,7 @@ class _StrataConnectorImpl:
         cfg = _load_connector_config(extra)
         use_cxl = bool(cfg["use_cxl"])
         writeback = bool(cfg["writeback"])
-        cpu_cap_mb = int(cfg["cpu_capacity_mb"])
+        cpu_cap_gb = int(cfg["cpu_capacity_gb"])
         self._block_size = int(getattr(vllm_config.cache_config, "block_size", 16))
         self._chunk_size = int(cfg["chunk_size"])
         self._bundle_layers = bool(cfg["bundle_layers"])
@@ -879,10 +900,56 @@ class _StrataConnectorImpl:
         self._last_logged_io_total = -1
         self._last_logged_sched_calls = -1
 
-        tiers = [CpuMemoryLayer(capacity_bytes=cpu_cap_mb * 1024 * 1024, store_name="cpu")]
+        # CPU tier: optionally back by a pinned slab (B1+B2), optionally
+        # via the lazy/expanding allocator (B5), with capacity clamped to
+        # what the OS can actually give us (B9), and optionally NUMA-bound
+        # to the GPU's socket (B6). All toggles default to off so existing
+        # workloads see the same shape.
+        cpu_cap_bytes = cpu_cap_gb * 1024 * 1024 * 1024
+        if cfg.get("use_pinned_slab"):
+            from stratacache.backend.cpu import (
+                CpuAllocator,
+                CpuMemoryLayer as _CpuLayer,
+                LazyCpuAllocator,
+            )
+            from stratacache.backend.cpu.cpu_allocator import (
+                clamp_capacity_to_system,
+            )
+
+            reserve = int(cfg["reserve_local_cpu_mb"]) * 1024 * 1024
+            effective_cap = clamp_capacity_to_system(
+                cpu_cap_bytes, reserve_bytes=reserve
+            )
+            numa_node = int(cfg["numa_node"])
+            numa_arg = numa_node if numa_node >= 0 else None
+            if cfg.get("use_lazy_allocator"):
+                init_b = int(cfg["lazy_initial_mb"]) * 1024 * 1024 or None
+                step_b = int(cfg["lazy_growth_step_mb"]) * 1024 * 1024 or None
+                allocator = LazyCpuAllocator(
+                    capacity_bytes=effective_cap,
+                    initial_bytes=init_b,
+                    growth_step_bytes=step_b,
+                    pin_memory=True,
+                )
+            else:
+                allocator = CpuAllocator(
+                    capacity_bytes=effective_cap,
+                    pin_memory=True,
+                    numa_node=numa_arg,
+                )
+            tiers = [
+                _CpuLayer(
+                    capacity_bytes=effective_cap,
+                    store_name="cpu",
+                    allocator=allocator,
+                )
+            ]
+        else:
+            tiers = [CpuMemoryLayer(capacity_bytes=cpu_cap_bytes, store_name="cpu")]
+
         links: list[LinkPolicy] = []
         if use_cxl:
-            from stratacache.backend.cxl.store import CxlConfig, CxlMemoryLayer
+            from stratacache.backend.cxl import CxlConfig, CxlMemoryLayer
 
             dax = cfg.get("cxl_dax_device")
             reset_md = bool(cfg["cxl_reset_metadata"])
@@ -900,6 +967,44 @@ class _StrataConnectorImpl:
         self._chain_key = _chain_key_from_config(cfg, vllm_config)
         self._chain = _get_or_create_chain(key=self._chain_key, tiers=tiers, links=links)
         self._engine = StorageEngine(self._chain)
+
+        # ---- Phase 3 plug-ins ----
+        self._token_db = None
+        if cfg.get("use_token_database"):
+            from stratacache.artifacts.kv.token_database import (
+                ChunkedTokenDatabase,
+            )
+
+            mc = getattr(vllm_config, "model_config", None)
+            model_tag = getattr(mc, "served_model_name", None) or getattr(mc, "model", None) or "model"
+            pc = getattr(vllm_config, "parallel_config", None)
+            self._token_db = ChunkedTokenDatabase(
+                chunk_size=int(self._chunk_size),
+                engine_tag="vllm013",
+                model_tag=str(model_tag),
+                tp=getattr(pc, "tensor_parallel_size", None),
+                rank=getattr(pc, "rank", None),
+                save_partial_chunks=bool(self._save_partial_chunks),
+            )
+
+        self._kv_event_translator = None
+        if cfg.get("expose_kv_events"):
+            from stratacache.artifacts.kv.kv_events import KVEventTranslator
+
+            self._kv_event_translator = KVEventTranslator()
+            self._engine.set_event_sink(self._kv_event_translator.on_backend_event)
+
+        self._gpu_paged = None
+        if cfg.get("use_layerwise_pipeline"):
+            try:
+                from stratacache.gpu import MultiLayerPagedConnector
+
+                self._gpu_paged = MultiLayerPagedConnector()
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "use_layerwise_pipeline=True but MultiLayerPagedConnector "
+                    "could not be initialised; falling back to legacy path."
+                )
 
         # Per-memory-layer IO attribution (by fetch hit tier and by write-through policy).
         self._tier_names = list(self._engine.tier_names)
@@ -922,15 +1027,29 @@ class _StrataConnectorImpl:
         self._alloc_blocks: dict[str, list[int]] = {}
         self._num_external_tokens: dict[str, int] = {}
         self._prompt_tokens: dict[str, list[int]] = {}
+        # Cached prefix-hash map per request (populated once by
+        # get_num_new_matched_tokens, salvaged in update_state_after_alloc,
+        # forwarded to the worker via StrataKVReq.ph_map).
+        self._ph_map_by_req: dict[str, dict[int, str]] = {}
 
         # worker-side cached references to vLLM KV layers (filled lazily from ForwardContext)
         self._kv_caches: dict[str, "torch.Tensor"] = {}
         self._expected_num_layers: Optional[int] = _infer_num_layers_from_vllm_config(vllm_config)
 
+        # KV bundleT schema template populated on the first save so that the
+        # CXL load path can reconstruct (dtype, full_shape) without the
+        # CXL backend having to persist user-meta. See ARCHITECTURE.md
+        # discussion of the codec-on-CXL question.
+        # Layout: {"dtype": "bfloat16",
+        #          "has_kv2": bool,           # True for [2, B, S, ...] KV layout
+        #          "tail": tuple[int,...],   # per-layer dims AFTER the slot dim
+        #          "elem_size": int}
+        self._kv_template: Optional[dict[str, Any]] = None
+
         # Bundle buffer: (req_id, chunk_end) -> {layer_idx: bytes}
         self._bundle_buf: dict[tuple[str, int], dict[int, bytes]] = {}
 
-        # Fast save path (LMCache-like): enqueue per-layer references in save_kv_layer,
+        # Fast save path: enqueue per-layer references in save_kv_layer,
         # do heavy gather/encode/store once per step in wait_for_save.
         # Keyed by (req_id, chunk_end).
         self._pending_save: dict[tuple[str, int], dict[str, Any]] = {}
@@ -966,8 +1085,8 @@ class _StrataConnectorImpl:
 
     def _init_kv_caches_from_forward_context(self, forward_context: Any) -> None:
         """
-        vLLM v0.13 ForwardContext does not pass KV tensors into connector hooks.
-        LMCache discovers them via forward_context.no_compile_layers[*].kv_cache.
+        vLLM v0.13 ForwardContext does not pass KV tensors into connector
+        hooks; discover them via forward_context.no_compile_layers[*].kv_cache.
         """
         ncl = getattr(forward_context, "no_compile_layers", None)
         if not isinstance(ncl, dict):
@@ -1020,6 +1139,180 @@ class _StrataConnectorImpl:
         raw, dtype_str, shape = _encode_tensor_raw_payload(t)
         return raw, {"tensor_codec": "stable_raw", "tensor_dtype": dtype_str, "tensor_shape": shape}
 
+    def _maybe_update_kv_template(self, stacked: "torch.Tensor") -> None:
+        """
+        Cache the KV bundleT schema (dtype + per-layer shape minus slot dim)
+        from the first stacked tensor we see. Used later on the load path
+        to reconstruct shape from CXL `actual_size`.
+
+        `stacked` shape:
+        - K/V combined: [num_layers, 2, slots, *tail]
+        - K/V flat:     [num_layers, slots, *tail]
+        """
+        if self._kv_template is not None:
+            return
+        if stacked.dim() < 2:
+            return
+        has_kv2 = stacked.dim() >= 3 and int(stacked.size(1)) == 2
+        if has_kv2:
+            tail = tuple(int(x) for x in stacked.shape[3:])
+        else:
+            tail = tuple(int(x) for x in stacked.shape[2:])
+        self._kv_template = {
+            "dtype": str(stacked.dtype).replace("torch.", ""),
+            "has_kv2": has_kv2,
+            "tail": tail,
+            "elem_size": int(stacked.element_size()),
+        }
+
+    def _bundle_load_hint(
+        self, exp: int, slots: int
+    ) -> tuple[Optional[str], Optional[tuple[int, ...]]]:
+        """
+        Build (dtype, full_shape) hint for a bundleT load given the chunk's
+        slot count. Returns (None, None) when no template is cached yet
+        (cold-start with CXL hit but no prior save) - in that case the
+        caller should fall back to bytes-mode and either reconstruct from
+        meta.attrs (CPU hit path) or skip the chunk.
+        """
+        tmpl = self._kv_template
+        if tmpl is None or exp <= 0 or slots <= 0:
+            return None, None
+        if tmpl["has_kv2"]:
+            full_shape = (int(exp), 2, int(slots), *tmpl["tail"])
+        else:
+            full_shape = (int(exp), int(slots), *tmpl["tail"])
+        return str(tmpl["dtype"]), tuple(int(x) for x in full_shape)
+
+    def _make_kv_memory_obj_pipelined(
+        self,
+        layers_dict: dict[int, "torch.Tensor"],
+        sm_slice: "torch.Tensor",
+        base_attrs: dict[str, Any],
+        exp: int,
+    ) -> Optional[tuple["MemoryObj", int]]:
+        """
+        A1+A2 pipelined path: skip the per-layer Python `_gather_by_slots`
+        + `torch.stack` and gather all `exp` layers into one slab-backed
+        host buffer using `MultiLayerPagedConnector.gather_chunk` on a
+        dedicated CUDA stream. Returns None when the pipeline is disabled
+        or unable to run, in which case the caller should fall back to
+        the legacy stack-based path.
+        """
+        if self._gpu_paged is None:
+            return None
+        if exp <= 0 or len(layers_dict) < exp:
+            return None
+        from stratacache.core.memory_obj import TensorMemoryObj
+
+        layers_list = [layers_dict[i] for i in range(exp)]
+        sample_flat = self._gpu_paged._flatten_slots(layers_list[0])
+        rng = self._gpu_paged._maybe_contig_range(sm_slice)
+        if rng is not None:
+            s0, ln = rng
+            if sample_flat.dim() >= 2 and sample_flat.size(0) == 2:
+                per_shape: tuple[int, ...] = (2, ln, *sample_flat.shape[2:])
+            else:
+                per_shape = (ln, *sample_flat.shape[1:])
+        else:
+            try:
+                n = int((sm_slice >= 0).sum().item())
+            except Exception:  # noqa: BLE001
+                return None
+            if sample_flat.dim() >= 2 and sample_flat.size(0) == 2:
+                per_shape = (2, n, *sample_flat.shape[2:])
+            else:
+                per_shape = (n, *sample_flat.shape[1:])
+
+        dtype = sample_flat.dtype
+        full_shape = (exp, *per_shape)
+        from functools import reduce
+        from operator import mul
+
+        numel = reduce(mul, full_shape, 1)
+        elem_size = sample_flat.element_size()
+        nbytes = int(numel * elem_size)
+
+        alloc = self._engine.get_cpu_allocator()
+        slot = None
+        if alloc is not None and alloc.has_slab:
+            slot = alloc.try_allocate(nbytes)
+            if slot is None:
+                cpu_layer = self._chain.tiers[0]
+                if hasattr(cpu_layer, "allocate_slot"):
+                    slot = cpu_layer.allocate_slot(nbytes, busy_loop=False)
+        if slot is not None:
+            host = slot.tensor_view().view(dtype).reshape(full_shape)
+            release_cb = slot.free
+        else:
+            pin = bool(alloc.pin_memory) if alloc is not None else False
+            host = torch.empty(full_shape, dtype=dtype, pin_memory=pin)
+            release_cb = None
+
+        try:
+            self._gpu_paged.gather_chunk(layers_list, sm_slice, host)
+            self._gpu_paged.synchronize_store()
+        except Exception:  # noqa: BLE001
+            logger.exception("Pipelined gather failed; falling back to legacy path.")
+            if slot is not None:
+                slot.free()
+            return None
+
+        # Cache schema for the CXL load path.
+        self._maybe_update_kv_template(host)
+
+        attrs = dict(base_attrs)
+        attrs.setdefault("tensor_codec", "stable_raw")
+        attrs.setdefault("tensor_dtype", str(dtype).replace("torch.", ""))
+        attrs.setdefault("tensor_shape", [int(x) for x in full_shape])
+        meta = ArtifactMeta(artifact_type=ArtifactType.KV_BLOCKS, attrs=attrs)
+        mo = TensorMemoryObj(
+            host, meta, size=nbytes, release_callback=release_cb
+        )
+        return mo, nbytes
+
+    def _make_kv_memory_obj(
+        self, t: "torch.Tensor", base_attrs: dict[str, Any]
+    ) -> tuple["MemoryObj", int]:
+        # Cache KV bundleT schema for the CXL load path. `t` here is the
+        # already-stacked tensor with shape (num_layers, ...).
+        if int(base_attrs.get("bundle_layers", 0)) > 0:
+            self._maybe_update_kv_template(t)
+
+        """
+        Produce a MemoryObj for a gathered KV tensor and return (memory_obj,
+        size_bytes).
+
+        Preferred path (default `stable_raw` codec): wraps `t` in a
+        TensorMemoryObj backed by the head CPU allocator's slab when one is
+        available; this is the zero-bytes-roundtrip path. Falls back to
+        BytesMemoryObj for the `torchsave` and in-payload-header `stable`
+        codecs which need a serialized representation on disk.
+        """
+        from stratacache.backend.cpu.factory import cpu_memory_obj_from_tensor
+
+        if self._tensor_codec == "stable_raw" or (
+            self._tensor_codec == "stable" and not self._tensor_header_in_payload
+        ):
+            attrs = dict(base_attrs)
+            attrs.setdefault("tensor_codec", "stable_raw")
+            attrs.setdefault("tensor_dtype", str(t.dtype).replace("torch.", ""))
+            attrs.setdefault("tensor_shape", [int(x) for x in t.shape])
+            meta = ArtifactMeta(artifact_type=ArtifactType.KV_BLOCKS, attrs=attrs)
+            mo = cpu_memory_obj_from_tensor(
+                t,
+                meta,
+                allocator=self._engine.get_cpu_allocator(),
+            )
+            return mo, mo.get_size()
+
+        # Legacy / framed encoders still need a bytes blob.
+        payload, tattrs = self._encode_tensor(t)
+        attrs = dict(base_attrs)
+        attrs.update(tattrs)
+        meta = ArtifactMeta(artifact_type=ArtifactType.KV_BLOCKS, attrs=attrs)
+        return BytesMemoryObj(payload, meta), len(payload)
+
     def _decode_tensor(self, b: bytes, device: "torch.device", meta: Optional[ArtifactMeta] = None) -> "torch.Tensor":
         attrs = dict(getattr(meta, "attrs", {}) or {}) if meta is not None else {}
         codec = str(attrs.get("tensor_codec", ""))
@@ -1032,6 +1325,60 @@ class _StrataConnectorImpl:
                 return _decode_tensor_raw_payload(b, dtype_str=dtype_str, shape=shape, device=device)
         # Backward compatibility: old stable payload with in-band header.
         return _decode_tensor_stable(b, device=device)
+
+    def _try_pipelined_scatter_bundleT(
+        self,
+        mo: MemoryObj,
+        layer_items: list[tuple[int, "torch.Tensor"]],
+        sm_slice: "torch.Tensor",
+    ) -> bool:
+        """
+        A1+A2 load fast path. When `mo` is a slab-backed bundleT
+        TensorMemoryObj of shape [exp, ...per-layer...], scatter every
+        layer into the GPU paged tensors via `MultiLayerPagedConnector`.
+
+        Returns True on success; False (and the caller falls back to the
+        legacy path) when the pipeline can't run.
+        """
+        if self._gpu_paged is None:
+            return False
+        host = mo.tensor
+        if host is None:
+            return False
+        try:
+            layers_list = [kv for _, kv in layer_items]
+            self._gpu_paged.scatter_chunk(layers_list, sm_slice, host)
+            self._gpu_paged.synchronize_load()
+            return True
+        except Exception:  # noqa: BLE001
+            logger.exception("Pipelined scatter failed; falling back to legacy path.")
+            return False
+
+    def _decode_tensor_from_mo(
+        self, mo: MemoryObj, device: "torch.device"
+    ) -> "torch.Tensor":
+        """
+        Zero-copy fast path: if the MemoryObj already exposes a typed
+        tensor view (slab-backed TensorMemoryObj), copy it straight to
+        `device`. Otherwise fall back to the bytes-codec decoder.
+        """
+        t = mo.tensor
+        if t is not None:
+            # Order the H2D back to GPU after any in-flight D2H from the
+            # producer, but do it via stream-side wait so the host doesn't
+            # block. When producer and consumer share the default stream
+            # (the common case) this is effectively a no-op.
+            mo.wait_pending_on_stream()
+            # The slab tensor must outlive the device tensor; .to(device)
+            # already produces a fresh device-side allocation.
+            if t.device == device:
+                return t.clone()
+            return t.to(device, non_blocking=True)
+        return self._decode_tensor(
+            mo.byte_array,
+            device=device,
+            meta=mo.metadata.artifact_meta,
+        )
 
     # ---------- scheduler side ----------
 
@@ -1054,7 +1401,7 @@ class _StrataConnectorImpl:
         n = len(token_ids)
         cs = max(1, int(self._chunk_size))
         boundaries = list(range(cs, (n // cs) * cs + 1, cs))
-        # Optionally include the last partial chunk boundary (LMCache saves last chunk on last prefill).
+        # Optionally include the last partial chunk boundary.
         if self._save_partial_chunks and (n % cs != 0):
             boundaries.append(n)
         self._stats["sched_calls"] += 1
@@ -1106,30 +1453,18 @@ class _StrataConnectorImpl:
             pref = ph_map.get(end)
             if pref is None:
                 break
-            # Prefer checking actual layer0 payload existence to avoid relying
-            # on small manifest markers that may be evicted under LRU pressure.
+            # bundle_layers=True is the default and only writes bundleT;
+            # bundle_layers=False writes per-layer artifacts. One contains
+            # against the format we actually wrote is enough.
             if self._bundle_layers:
-                # Prefer newest bundle format first.
                 lid0 = self._chunk_bundle_tensor_id(pref, end)
             else:
                 lid0 = self._chunk_layer_id(pref, end, 0)
             hit_tier = self._engine.contains(lid0).hit_tier
             if hit_tier is None:
-                # Backward compat:
-                # - If bundle mode is on but cache was written in per-layer mode, try layer0.
-                # - As a last resort, fall back to manifest existence (may overestimate if payload evicted).
-                if self._bundle_layers:
-                    # Try old bundle format.
-                    hit_tier = self._engine.contains(self._chunk_bundle_id(pref, end)).hit_tier
-                if hit_tier is None and self._bundle_layers:
-                    hit_tier = self._engine.contains(self._chunk_layer_id(pref, end, 0)).hit_tier
-                if hit_tier is None:
-                    mid = self._chunk_manifest_id(pref, end)
-                    hit_tier = self._engine.contains(mid).hit_tier
-                    if hit_tier is None:
-                        self._stats["manifest_misses"] += 1
-                        st["next_idx"] = i
-                        break
+                self._stats["manifest_misses"] += 1
+                st["next_idx"] = i
+                break
             tier = self._tier_names[int(hit_tier)]
             self._stats["manifest_hits"] += 1
             self._io_by_tier[tier]["manifest_hits"] += 1
@@ -1144,7 +1479,7 @@ class _StrataConnectorImpl:
             _prof_record("scheduler.get_num_new_matched_tokens", time.perf_counter() - _t0_prof)
             return 0
 
-        # Full prompt hit: subtract 1 token to recompute logits (same idea as LMCache).
+        # Full prompt hit: subtract 1 token to force a logits recompute.
         if cached_tokens == n:
             cached_tokens = max(0, cached_tokens - 1)
 
@@ -1163,7 +1498,7 @@ class _StrataConnectorImpl:
                 rd["gpu"] = int(num_computed_tokens)
 
                 # External tokens are the part beyond what vLLM already has.
-                # Use chunk-aligned start (LMCache masking strategy).
+                # Use chunk-aligned start so the boundaries match what was stored.
                 cs = max(1, int(self._chunk_size))
                 ext_start = (int(num_computed_tokens) // cs) * cs
                 ext_end = int(cached_tokens)
@@ -1191,8 +1526,14 @@ class _StrataConnectorImpl:
             self._alloc_blocks[str(req_id)] = block_ids
             self._num_external_tokens[str(req_id)] = int(num_external_tokens)
             self._prompt_tokens[str(req_id)] = token_ids
-            # Reset scheduler incremental match cache for this request.
-            self._match_state_by_req.pop(str(req_id), None)
+            # Salvage the ph_map computed during get_num_new_matched_tokens
+            # before we drop the probe state, so build_connector_meta can
+            # forward it to the worker without re-hashing per step.
+            cached_st = self._match_state_by_req.pop(str(req_id), None)
+            if cached_st is not None:
+                ph = cached_st.get("ph_map") or {}
+                if ph:
+                    self._ph_map_by_req[str(req_id)] = dict(ph)
 
         # No INFO logging here; per-request summary is emitted on request_finished.
         # Track total tokens best-effort.
@@ -1284,6 +1625,14 @@ class _StrataConnectorImpl:
                 save_ends.append(save_len)
             _prof_record("scheduler.build_connector_meta.add_req.compute_fields", time.perf_counter() - t0_calc)
 
+            # Forward whatever ph_map was salvaged from
+            # `get_num_new_matched_tokens` (kept across steps in
+            # `_ph_map_by_req`). Do NOT pre-compute missing boundaries
+            # here - this method runs per active req per step and a full
+            # SHA256 sweep over the prompt would dominate scheduler
+            # latency. Worker recomputes once if needed.
+            cached_ph = self._ph_map_by_req.get(str(req_id), {})
+
             t0_meta = time.perf_counter()
             meta.requests.append(
                 StrataKVReq(
@@ -1297,6 +1646,7 @@ class _StrataConnectorImpl:
                     prompt_hash="",
                     chunk_ends_to_load=load_ends,
                     chunk_ends_to_save=save_ends,
+                    ph_map=cached_ph,
                 )
             )
             _prof_record("scheduler.build_connector_meta.add_req.append_meta", time.perf_counter() - t0_meta)
@@ -1450,12 +1800,13 @@ class _StrataConnectorImpl:
             self._pending_ends_by_req.pop(rid, None)
             self._slot_mapping_by_req.pop(rid, None)
             self._slot_blocks_by_req.pop(rid, None)
-            # Scheduler-side state cleanup to keep maps bounded (LMCache-style lifecycle).
+            # Scheduler-side state cleanup to keep per-request maps bounded.
             with self._lock:
                 self._prompt_tokens.pop(rid, None)
                 self._alloc_blocks.pop(rid, None)
                 self._num_external_tokens.pop(rid, None)
                 self._match_state_by_req.pop(rid, None)
+                self._ph_map_by_req.pop(rid, None)
             self._loaded_or_attempted.discard(rid)
         _prof_record("scheduler.request_finished", time.perf_counter() - _t0_prof)
         return False, None
@@ -1502,7 +1853,7 @@ class _StrataConnectorImpl:
 
         kv_caches = kwargs.get("kv_caches")
         if kv_caches is None:
-            # vLLM v0.13: discover KV layers from ForwardContext (LMCache pattern).
+            # vLLM v0.13: discover KV layers from ForwardContext.
             if len(self._kv_caches) == 0:
                 self._init_kv_caches_from_forward_context(forward_context)
             if len(self._kv_caches) > 0:
@@ -1527,7 +1878,7 @@ class _StrataConnectorImpl:
             cs = max(1, int(self._chunk_size))
             # IMPORTANT: vLLM may already have a prefix in GPU cache (its own
             # prefix cache). Only load the range beyond that prefix, aligned
-            # down to chunk boundary (same masking strategy as LMCache).
+            # down to chunk boundary.
             load_start = (vllm_cached // cs) * cs
             if load_start >= cached_total:
                 continue
@@ -1540,7 +1891,12 @@ class _StrataConnectorImpl:
             ]
             if not chunk_ends:
                 continue
-            ph_map = _prefix_hashes(req.token_ids, chunk_ends)
+            # Reuse scheduler-computed ph_map; only fall back to a local
+            # SHA256 sweep for boundaries the scheduler didn't pre-hash.
+            ph_map = {e: req.ph_map[e] for e in chunk_ends if e in req.ph_map}
+            missing = [e for e in chunk_ends if e not in ph_map]
+            if missing:
+                ph_map.update(_prefix_hashes(req.token_ids, missing))
 
             # We'll count "actual loaded tokens" best-effort based on layer0 progress.
             loaded_tokens_for_req = 0
@@ -1565,97 +1921,51 @@ class _StrataConnectorImpl:
                         break
                     # Prefer new bundleT tensor format.
                     aid = self._chunk_bundle_tensor_id(pref, end)
+                    # Build a (dtype, shape) hint from the cached KV
+                    # template so a CXL hit can come back as a typed
+                    # TensorMemoryObj (CXL doesn't persist user-meta).
+                    hint_dtype, hint_shape = self._bundle_load_hint(
+                        int(self._expected_num_layers or 0),
+                        int(end - chunk_start),
+                    )
                     try:
-                        fr = self._engine.load(aid, promote=False)
+                        fr = self._engine.load(
+                            aid,
+                            promote=False,
+                            dtype=hint_dtype,
+                            shape=hint_shape,
+                        )
                         _prof_record("worker.start_load_kv.bundle.fetch", time.perf_counter() - t_fetch0)
                         t_dec0 = time.perf_counter()
-                        stacked = self._decode_tensor(fr.memory_obj.byte_array, device=layer_items[0][1].device, meta=fr.memory_obj.metadata.artifact_meta)
+                        stacked = self._decode_tensor_from_mo(fr.memory_obj, device=layer_items[0][1].device)
                         _prof_record("worker.start_load_kv.bundleT.decode_tensor", time.perf_counter() - t_dec0)
                     except ArtifactNotFound:
-                        fr = None  # type: ignore[assignment]
-                        stacked = None
+                        # bundleT is the only KV format we write under
+                        # bundle_layers=True; on miss, just stop the chain.
+                        break
                     except Exception:  # noqa: BLE001
                         break
 
-                    # If bundleT missing, try old bundle format; then per-layer artifacts.
-                    if fr is None or stacked is None:
-                        try:
-                            fr = self._engine.load(self._chunk_bundle_id(pref, end), promote=False)
-                            t_dec0 = time.perf_counter()
-                            bundle = _decode_bundle(fr.memory_obj.byte_array)
-                            _prof_record("worker.start_load_kv.bundle.decode_bundle", time.perf_counter() - t_dec0)
-                            # Scatter available layers (old bundle: per-layer bytes).
-                            tier = self._tier_names[fr.hit_tier]
-                            for layer_idx, kv_layer in layer_items:
-                                pb = bundle.get(int(layer_idx))
-                                if pb is None:
-                                    continue
-                                t_dec1 = time.perf_counter()
-                                gathered = self._decode_tensor(pb, device=kv_layer.device)
-                                _prof_record("worker.start_load_kv.bundle.decode_tensor", time.perf_counter() - t_dec1)
-                                try:
-                                    t_sc0 = time.perf_counter()
-                                    _scatter_by_slots(kv_layer, sm_slice, gathered)
-                                    _prof_record("worker.start_load_kv.bundle.scatter", time.perf_counter() - t_sc0)
-                                except RuntimeError:
-                                    break
-                            # Attribute one chunk
-                            self._stats["loaded_chunks"] += 1
-                            self._stats["bytes_loaded"] += len(fr.memory_obj.byte_array)
-                            self._io_by_tier[tier]["bytes_loaded"] += len(fr.memory_obj.byte_array)
-                            self._io_by_tier[tier]["chunks_loaded"] += 1
-                            dt = int(end - chunk_start)
-                            loaded_tokens_for_req += dt
-                            self._io_by_tier[tier]["tokens_loaded"] += dt
-                            chunk_start = end
-                            continue
-                        except ArtifactNotFound:
-                            pass
-
-                    if fr is None or stacked is None:
+                    tier = self._tier_names[fr.hit_tier]
+                    # A1+A2 fast scatter: one stream-overlapped batch.
+                    if not self._try_pipelined_scatter_bundleT(
+                        fr.memory_obj, layer_items, sm_slice
+                    ):
+                        # Legacy: per-layer Python scatter from stacked tensor.
                         for layer_idx, kv_layer in layer_items:
-                            laid = self._chunk_layer_id(pref, end, int(layer_idx))
+                            li = int(layer_idx)
+                            if stacked.dim() < 1 or li >= int(stacked.size(0)):
+                                continue
                             try:
-                                lfr = self._engine.load(laid, promote=False)
-                            except ArtifactNotFound:
-                                break
-                            gathered = self._decode_tensor(lfr.memory_obj.byte_array, device=kv_layer.device, meta=lfr.memory_obj.metadata.artifact_meta)
-                            try:
-                                _scatter_by_slots(kv_layer, sm_slice, gathered)
+                                t_sc0 = time.perf_counter()
+                                _scatter_by_slots(kv_layer, sm_slice, stacked[li])
+                                _prof_record("worker.start_load_kv.bundleT.scatter", time.perf_counter() - t_sc0)
                             except RuntimeError:
                                 break
-                        # Attribute tokens as tier of layer0 if present; otherwise unknown -> skip.
-                        try:
-                            l0 = self._engine.load(self._chunk_layer_id(pref, end, 0), promote=False)
-                            tier = self._tier_names[l0.hit_tier]
-                            self._stats["loaded_chunks"] += 1
-                            self._stats["bytes_loaded"] += len(l0.memory_obj.byte_array)
-                            self._io_by_tier[tier]["bytes_loaded"] += len(l0.memory_obj.byte_array)
-                            self._io_by_tier[tier]["chunks_loaded"] += 1
-                            dt = int(end - chunk_start)
-                            loaded_tokens_for_req += dt
-                            self._io_by_tier[tier]["tokens_loaded"] += dt
-                        except Exception:  # noqa: BLE001
-                            pass
-                        chunk_start = end
-                        continue
-
-                    tier = self._tier_names[fr.hit_tier]
-                    # Scatter from stacked tensor: stacked[layer_idx] -> KV layer.
-                    for layer_idx, kv_layer in layer_items:
-                        li = int(layer_idx)
-                        if stacked.dim() < 1 or li >= int(stacked.size(0)):
-                            continue
-                        try:
-                            t_sc0 = time.perf_counter()
-                            _scatter_by_slots(kv_layer, sm_slice, stacked[li])
-                            _prof_record("worker.start_load_kv.bundleT.scatter", time.perf_counter() - t_sc0)
-                        except RuntimeError:
-                            break
                     # Attribution: count one "loaded chunk" per chunk (not per layer)
                     self._stats["loaded_chunks"] += 1
-                    self._stats["bytes_loaded"] += len(fr.memory_obj.byte_array)
-                    self._io_by_tier[tier]["bytes_loaded"] += len(fr.memory_obj.byte_array)
+                    self._stats["bytes_loaded"] += fr.memory_obj.get_size()
+                    self._io_by_tier[tier]["bytes_loaded"] += fr.memory_obj.get_size()
                     self._io_by_tier[tier]["chunks_loaded"] += 1
                     dt = int(end - chunk_start)
                     loaded_tokens_for_req += dt
@@ -1679,15 +1989,15 @@ class _StrataConnectorImpl:
                                 fr = self._engine.load(aid, promote=False)
                             except ArtifactNotFound:
                                 break
-                            gathered = self._decode_tensor(fr.memory_obj.byte_array, device=kv_layer.device, meta=fr.memory_obj.metadata.artifact_meta)
+                            gathered = self._decode_tensor_from_mo(fr.memory_obj, device=kv_layer.device)
                             try:
                                 _scatter_by_slots(kv_layer, sm_slice, gathered)
                             except RuntimeError:
                                 break
                             self._stats["loaded_chunks"] += 1
-                            self._stats["bytes_loaded"] += len(fr.memory_obj.byte_array)
+                            self._stats["bytes_loaded"] += fr.memory_obj.get_size()
                             tier = self._tier_names[fr.hit_tier]
-                            self._io_by_tier[tier]["bytes_loaded"] += len(fr.memory_obj.byte_array)
+                            self._io_by_tier[tier]["bytes_loaded"] += fr.memory_obj.get_size()
                             self._io_by_tier[tier]["chunks_loaded"] += 1
                             if layer_idx == 0:
                                 dt = int(end - chunk_start)
@@ -1709,15 +2019,15 @@ class _StrataConnectorImpl:
                                 fr = self._engine.load(aid, promote=False)
                             except ArtifactNotFound:
                                 break
-                            gathered = self._decode_tensor(fr.memory_obj.byte_array, device=kv_layer.device, meta=fr.memory_obj.metadata.artifact_meta)
+                            gathered = self._decode_tensor_from_mo(fr.memory_obj, device=kv_layer.device)
                             try:
                                 _scatter_by_slots(kv_layer, sm_slice, gathered)
                             except RuntimeError:
                                 break
                             self._stats["loaded_chunks"] += 1
-                            self._stats["bytes_loaded"] += len(fr.memory_obj.byte_array)
+                            self._stats["bytes_loaded"] += fr.memory_obj.get_size()
                             tier = self._tier_names[fr.hit_tier]
-                            self._io_by_tier[tier]["bytes_loaded"] += len(fr.memory_obj.byte_array)
+                            self._io_by_tier[tier]["bytes_loaded"] += fr.memory_obj.get_size()
                             self._io_by_tier[tier]["chunks_loaded"] += 1
                             if layer_idx == 0:
                                 dt = int(end - chunk_start)
@@ -1786,7 +2096,10 @@ class _StrataConnectorImpl:
                     if not chunk_ends:
                         continue
                     self._pending_ends_by_req[str(req.req_id)] = list(int(e) for e in chunk_ends)
-                    ph_map = _prefix_hashes(req.token_ids, chunk_ends)
+                    ph_map = {e: req.ph_map[e] for e in chunk_ends if e in req.ph_map}
+                    missing = [e for e in chunk_ends if e not in ph_map]
+                    if missing:
+                        ph_map.update(_prefix_hashes(req.token_ids, missing))
                     chunk_start = int(prev_bundle)
                     for end in chunk_ends:
                         pref = ph_map.get(end)
@@ -1834,26 +2147,25 @@ class _StrataConnectorImpl:
             chunk_ends = [e for e in chunk_ends if e > prev_layer]
             if not chunk_ends:
                 continue
-            ph_map = _prefix_hashes(req.token_ids, chunk_ends)
+            ph_map = {e: req.ph_map[e] for e in chunk_ends if e in req.ph_map}
+            missing = [e for e in chunk_ends if e not in ph_map]
+            if missing:
+                ph_map.update(_prefix_hashes(req.token_ids, missing))
             chunk_start = prev_layer
             for end in chunk_ends:
                 pref = ph_map.get(end)
                 if pref is None:
                     break
                 gathered = _gather_by_slots(kv_layer, req.slot_mapping[chunk_start:end]).detach()
-                payload, tattrs = self._encode_tensor(gathered)
-                attrs = {"chunk_start": chunk_start, "chunk_end": end}
-                attrs.update(tattrs)
+                base_attrs = {"chunk_start": chunk_start, "chunk_end": end}
+                memory_obj, payload_size = self._make_kv_memory_obj(gathered, base_attrs)
                 self._engine.store(
                     self._chunk_layer_id(pref, end, idx),
-                    BytesMemoryObj(
-                        payload,
-                        ArtifactMeta(artifact_type=ArtifactType.KV_BLOCKS, attrs=attrs),
-                    ),
+                    memory_obj,
                 )
                 self._stats["stored_chunks"] += 1
-                self._stats["bytes_stored"] += len(payload)
-                remaining = len(payload)
+                self._stats["bytes_stored"] += payload_size
+                remaining = payload_size
                 for ti, tname in enumerate(self._tier_names):
                     if ti == 0:
                         self._io_by_tier[tname]["bytes_stored"] += remaining
@@ -1924,7 +2236,7 @@ class _StrataConnectorImpl:
 
     def wait_for_save(self) -> None:
         # v0.13.0 calls this at forward_context exit; use it as the synchronization
-        # point to do heavy gather/encode/store (LMCache-like strategy).
+        # point to do heavy gather/encode/store once per chunk.
         _t0 = time.perf_counter()
         if not self._bundle_layers:
             _prof_record("worker.wait_for_save", time.perf_counter() - _t0)
@@ -1951,13 +2263,11 @@ class _StrataConnectorImpl:
             if sm_slice is None:
                 continue
 
-            # Cross-request dedup: if this chunk is already cached, skip expensive
-            # gather/encode/store and only advance watermark.
-            if (
-                self._engine.contains(self._chunk_bundle_tensor_id(pref, int(end))).exists
-                or self._engine.contains(self._chunk_bundle_id(pref, int(end))).exists
-                or self._engine.contains(self._chunk_layer_id(pref, int(end), 0)).exists
-            ):
+            # Cross-request dedup: if this chunk is already cached, skip
+            # expensive gather/encode/store and only advance watermark.
+            # We always write bundleT in the default config, so a single
+            # contains check is sufficient.
+            if self._engine.contains(self._chunk_bundle_tensor_id(pref, int(end))).exists:
                 bundle_key = (req_id, -1)
                 self._saved_upto_by_req_layer[bundle_key] = max(
                     int(self._saved_upto_by_req_layer.get(bundle_key, 0)),
@@ -1972,46 +2282,47 @@ class _StrataConnectorImpl:
                         self._pending_keys_by_req.pop(str(req_id), None)
                 continue
 
-            # Gather tensors per layer (device-side), stack, encode once, store once.
-            t_g0 = time.perf_counter()
-            gathered_layers = []
-            for li in range(exp):
-                kv_layer = layers.get(li)
-                if kv_layer is None:
-                    break
-                gathered_layers.append(_gather_by_slots(kv_layer, sm_slice).detach())
-            if len(gathered_layers) != exp:
-                continue
-            stacked = torch.stack(gathered_layers, dim=0)
-            _prof_record("worker.wait_for_save.bundleT.gather_stack", time.perf_counter() - t_g0)
-
-            t_e0 = time.perf_counter()
-            payload, tattrs = self._encode_tensor(stacked)
-            _prof_record("worker.wait_for_save.bundleT.encode_tensor", time.perf_counter() - t_e0)
-
-            t_s0 = time.perf_counter()
-            attrs = {
+            base_attrs = {
                 "chunk_start": int(chunk_start),
                 "chunk_end": int(end),
                 "bundle_layers": exp,
                 "bundle_format": "tensor",
             }
-            attrs.update(tattrs)
+
+            # A1+A2 fast path: pipelined gather straight into a slab-backed
+            # host buffer, no per-layer Python stack.
+            t_g0 = time.perf_counter()
+            pipelined = self._make_kv_memory_obj_pipelined(layers, sm_slice, base_attrs, exp)
+            if pipelined is not None:
+                memory_obj, payload_size = pipelined
+                _prof_record("worker.wait_for_save.bundleT.pipelined", time.perf_counter() - t_g0)
+            else:
+                # Legacy: per-layer gather + stack + encode.
+                gathered_layers = []
+                for li in range(exp):
+                    kv_layer = layers.get(li)
+                    if kv_layer is None:
+                        break
+                    gathered_layers.append(_gather_by_slots(kv_layer, sm_slice).detach())
+                if len(gathered_layers) != exp:
+                    continue
+                stacked = torch.stack(gathered_layers, dim=0)
+                _prof_record("worker.wait_for_save.bundleT.gather_stack", time.perf_counter() - t_g0)
+
+                t_e0 = time.perf_counter()
+                memory_obj, payload_size = self._make_kv_memory_obj(stacked, base_attrs)
+                _prof_record("worker.wait_for_save.bundleT.encode_tensor", time.perf_counter() - t_e0)
+
+            t_s0 = time.perf_counter()
             self._engine.store(
                 self._chunk_bundle_tensor_id(pref, int(end)),
-                BytesMemoryObj(
-                    payload,
-                    ArtifactMeta(
-                        artifact_type=ArtifactType.KV_BLOCKS,
-                        attrs=attrs,
-                    ),
-                ),
+                memory_obj,
             )
             _prof_record("worker.wait_for_save.bundleT.store", time.perf_counter() - t_s0)
 
             self._stats["stored_chunks"] += 1
-            self._stats["bytes_stored"] += len(payload)
-            remaining = len(payload)
+            self._stats["bytes_stored"] += payload_size
+            remaining = payload_size
             for ti, tname in enumerate(self._tier_names):
                 if ti == 0:
                     self._io_by_tier[tname]["bytes_stored"] += remaining
@@ -2047,6 +2358,16 @@ class _StrataConnectorImpl:
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         return set()
+
+    def get_kv_events(self) -> list:
+        """
+        Drain the type-agnostic backend event stream, translated to
+        CacheStoreEvent / CacheRemoveEvent. Empty list when the
+        translator is disabled (default).
+        """
+        if self._kv_event_translator is None:
+            return []
+        return self._kv_event_translator.drain_events()
 
     def shutdown(self) -> None:
         _release_chain(getattr(self, "_chain_key", ""))
@@ -2085,6 +2406,9 @@ class StrataCacheConnectorV1(KVConnectorBase_V1):  # type: ignore[misc]
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         return self._impl.get_block_ids_with_load_errors()
+
+    def get_kv_events(self) -> list:
+        return self._impl.get_kv_events()
 
     def shutdown(self):
         return self._impl.shutdown()

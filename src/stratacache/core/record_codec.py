@@ -1,3 +1,12 @@
+"""
+Optional record framing utility (magic + meta-json + payload).
+
+Currently unused by the storage plane: the CXL backend stores raw payload
+only and reconstructs schema from caller-supplied dtype/shape hints (see
+CxlMemoryLayer + the connector's KV template). Kept here as a small
+self-contained codec in case a future backend (e.g. local disk) needs
+self-describing on-disk records.
+"""
 from __future__ import annotations
 
 import json

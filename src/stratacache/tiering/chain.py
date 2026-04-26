@@ -70,6 +70,11 @@ class TierChain:
     def close(self) -> None:
         self._wb.stop()
 
+    def set_event_sink(self, sink) -> None:
+        """Subscribe `sink` to admit/evict events from every tier (A11)."""
+        for t in self._tiers:
+            t.set_event_sink(sink)
+
     def _resolve_tier_type(self, tier: int | str) -> StrataTierType:
         if tier == -1 or tier == "gpu":
             return StrataTierType.GPU
@@ -108,12 +113,19 @@ class TierChain:
         with self._lock:
             return self._tiers[idx].exists(artifact_id)
 
-    def fetch(self, artifact_id: ArtifactId, *, promote: bool = True) -> FetchResult:
+    def fetch(
+        self,
+        artifact_id: ArtifactId,
+        *,
+        promote: bool = True,
+        dtype: Optional[str] = None,
+        shape: Optional[tuple[int, ...]] = None,
+    ) -> FetchResult:
         """Read-through lookup from top to bottom."""
         with self._lock:
             for i in range(len(self._tiers)):
                 try:
-                    mo = self._tier_get(i, artifact_id)
+                    mo = self._tier_get(i, artifact_id, dtype=dtype, shape=shape)
                 except ArtifactNotFound:
                     continue
 
@@ -124,11 +136,17 @@ class TierChain:
         raise ArtifactNotFound(str(artifact_id))
 
     def fetch_from(
-        self, tier: int | str, artifact_id: ArtifactId, *, promote: bool = False
+        self,
+        tier: int | str,
+        artifact_id: ArtifactId,
+        *,
+        promote: bool = False,
+        dtype: Optional[str] = None,
+        shape: Optional[tuple[int, ...]] = None,
     ) -> FetchResult:
         idx = self._resolve_tier_index(tier)
         with self._lock:
-            mo = self._tier_get(idx, artifact_id)
+            mo = self._tier_get(idx, artifact_id, dtype=dtype, shape=shape)
             if promote and idx > 0:
                 for up in range(0, idx):
                     self._put_direct(up, artifact_id, mo, reason=StoreReason.PROMOTION)
@@ -197,9 +215,16 @@ class TierChain:
 
     # ---- internals ----
 
-    def _tier_get(self, tier_index: int, artifact_id: ArtifactId) -> MemoryObj:
+    def _tier_get(
+        self,
+        tier_index: int,
+        artifact_id: ArtifactId,
+        *,
+        dtype: Optional[str] = None,
+        shape: Optional[tuple[int, ...]] = None,
+    ) -> MemoryObj:
         start_time = time.perf_counter()
-        mo = self._tiers[tier_index].get(artifact_id)
+        mo = self._tiers[tier_index].get(artifact_id, dtype=dtype, shape=shape)
         end_time = time.perf_counter()
         self._telemetry.on_tier_op_async(
             tier=self._resolve_tier_type(tier_index),

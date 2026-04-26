@@ -3,8 +3,11 @@ from __future__ import annotations
 from typing import Any
 
 from stratacache.artifacts.params.key_builder import build_param_chunk_id
+from stratacache.backend.cpu.factory import (
+    cpu_memory_obj_from_bytes,
+    cpu_memory_obj_from_tensor,
+)
 from stratacache.core.artifact import ArtifactId, ArtifactMeta, ArtifactType
-from stratacache.core.memory_obj import BytesMemoryObj
 from stratacache.engine.storage_engine import StorageEngine
 from stratacache.engine.types import AccessMode, ContainsResult
 
@@ -14,26 +17,14 @@ except Exception:  # noqa: BLE001
     torch = None  # type: ignore[assignment]
 
 
-_DTYPE_FROM_NAME: dict[str, Any] = {
-    "float16": getattr(torch, "float16", None),
-    "bfloat16": getattr(torch, "bfloat16", None),
-    "float32": getattr(torch, "float32", None),
-    "float64": getattr(torch, "float64", None),
-    "int8": getattr(torch, "int8", None),
-    "int16": getattr(torch, "int16", None),
-    "int32": getattr(torch, "int32", None),
-    "int64": getattr(torch, "int64", None),
-    "uint8": getattr(torch, "uint8", None),
-    "bool": getattr(torch, "bool", None),
-}
-
-
 class ParameterStoreClient:
     """
     Thin helper for parameter chunk offload/prefetch on top of StorageEngine.
 
-    NOTE: this phase keeps the v0.1 bytes-roundtrip path. Zero-copy via
-    TensorMemoryObj is part of the later allocator port (B1/B2/B3).
+    Phase 2: store path produces a TensorMemoryObj backed by the head CPU
+    allocator's slab when one is available (zero-copy into pinned host
+    memory). Falls back to a non-slab TensorMemoryObj otherwise. The
+    legacy bytes round-trip is gone.
     """
 
     def __init__(
@@ -87,7 +78,6 @@ class ParameterStoreClient:
             chunk_idx=chunk_idx,
         )
 
-        payload = _encode_tensor_raw(tensor)
         attrs = {
             "tensor_codec": "stable_raw",
             "tensor_dtype": dtype_name,
@@ -101,12 +91,12 @@ class ParameterStoreClient:
             attrs.update(dict(meta_extra))
 
         meta = ArtifactMeta(artifact_type=ArtifactType.PARAM_CHUNK, attrs=attrs)
-        self._engine.store(
-            aid,
-            BytesMemoryObj(payload, meta),
-            medium=medium,
-            mode=mode,
+        memory_obj = cpu_memory_obj_from_tensor(
+            tensor,
+            meta,
+            allocator=self._engine.get_cpu_allocator(),
         )
+        self._engine.store(aid, memory_obj, medium=medium, mode=mode)
         return aid
 
     def get_chunk(
@@ -116,6 +106,7 @@ class ParameterStoreClient:
         unit: str,
         dtype: str,
         chunk_idx: int,
+        shape: tuple[int, ...] | list[int] | None = None,
         device: "torch.device | str | None" = None,
         medium: int | str | None = None,
         mode: AccessMode | str = AccessMode.PREFER,
@@ -128,14 +119,33 @@ class ParameterStoreClient:
             dtype=dtype,
             chunk_idx=chunk_idx,
         )
-        lr = self._engine.load(aid, medium=medium, mode=mode, promote=promote)
-        attrs = dict(lr.memory_obj.metadata.artifact_meta.attrs)
-        return _decode_tensor_raw(
-            lr.memory_obj.byte_array,
-            dtype_name=str(attrs.get("tensor_dtype", dtype)),
-            shape=attrs.get("tensor_shape", []),
-            device=device,
+        # Pass dtype/shape as hints so a CXL hit can return a typed tensor
+        # directly (CXL doesn't persist user-meta).
+        shape_tuple = tuple(int(x) for x in shape) if shape is not None else None
+        lr = self._engine.load(
+            aid,
+            medium=medium,
+            mode=mode,
+            promote=promote,
+            dtype=dtype,
+            shape=shape_tuple,
         )
+        mo = lr.memory_obj
+        # Fast path: TensorMemoryObj already has a typed view.
+        t = mo.tensor
+        if t is None:
+            attrs = dict(mo.metadata.artifact_meta.attrs)
+            t = _decode_tensor_raw(
+                mo.byte_array,
+                dtype_name=str(attrs.get("tensor_dtype", dtype)),
+                shape=attrs.get("tensor_shape", shape_tuple or []),
+            )
+        # Always clone: the underlying buffer may be a slab/CXL-backed
+        # view and the caller's tensor must outlive it.
+        out = t.clone()
+        if device is not None:
+            out = out.to(device)
+        return out
 
     def has_chunk(
         self,
@@ -168,9 +178,18 @@ def _dtype_to_name(dtype: "torch.dtype") -> str:
     return s
 
 
-def _encode_tensor_raw(t: "torch.Tensor") -> bytes:
-    cpu = t.detach().to(device="cpu", copy=True).contiguous()
-    return cpu.view(torch.uint8).numpy().tobytes()
+_DTYPE_FROM_NAME: dict[str, Any] = {
+    "float16": getattr(torch, "float16", None) if torch is not None else None,
+    "bfloat16": getattr(torch, "bfloat16", None) if torch is not None else None,
+    "float32": getattr(torch, "float32", None) if torch is not None else None,
+    "float64": getattr(torch, "float64", None) if torch is not None else None,
+    "int8": getattr(torch, "int8", None) if torch is not None else None,
+    "int16": getattr(torch, "int16", None) if torch is not None else None,
+    "int32": getattr(torch, "int32", None) if torch is not None else None,
+    "int64": getattr(torch, "int64", None) if torch is not None else None,
+    "uint8": getattr(torch, "uint8", None) if torch is not None else None,
+    "bool": getattr(torch, "bool", None) if torch is not None else None,
+}
 
 
 def _decode_tensor_raw(
@@ -178,7 +197,6 @@ def _decode_tensor_raw(
     *,
     dtype_name: str,
     shape: list[int] | tuple[int, ...],
-    device: "torch.device | str | None" = None,
 ) -> "torch.Tensor":
     dtype = _DTYPE_FROM_NAME.get(str(dtype_name))
     if dtype is None:
@@ -186,7 +204,4 @@ def _decode_tensor_raw(
     if not isinstance(shape, (list, tuple)):
         raise ValueError(f"invalid tensor shape metadata: {shape}")
     out = torch.frombuffer(memoryview(payload), dtype=dtype)
-    out = out.clone().reshape(list(shape))
-    if device is not None:
-        out = out.to(device)
-    return out
+    return out.clone().reshape(list(shape))

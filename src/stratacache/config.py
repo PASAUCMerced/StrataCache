@@ -2,7 +2,6 @@
 """
 StrataCache Configuration Management
 
-Configuration system for StrataCache inspired by LMCache that:
 - Loads configuration from YAML file, environment variables, or parameters
 - Supports configuration aliases and deprecation handling
 - Provides convenient access to configuration values
@@ -103,11 +102,11 @@ _CONFIG_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "env_converter": _to_bool,
         "description": "Enable writeback feature",
     },
-    "connector_cpu_capacity_mb": {
+    "connector_cpu_capacity_gb": {
         "type": int,
-        "default": 61440,
+        "default": 60,
         "env_converter": _to_int,
-        "description": "CPU memory capacity in MB",
+        "description": "CPU memory capacity in GB",
     },
     "connector_chunk_size": {
         "type": int,
@@ -201,7 +200,7 @@ _CONFIG_DEFINITIONS: Dict[str, Dict[str, Any]] = {
 _CONFIG_ALIASES = {
     "use_cxl": "connector_use_cxl",
     "chunk_size": "connector_chunk_size",
-    "cpu_capacity_mb": "connector_cpu_capacity_mb",
+    "cpu_capacity_gb": "connector_cpu_capacity_gb",
 }
 
 # Deprecated configurations
@@ -212,9 +211,9 @@ _DEPRECATED_CONFIGS = {
 
 def _validate_config(self):
     """Validate configuration"""
-    if self.connector_cpu_capacity_mb <= 0:
+    if self.connector_cpu_capacity_gb <= 0:
         raise ValueError(
-            f"connector_cpu_capacity_mb must be positive, got {self.connector_cpu_capacity_mb}"
+            f"connector_cpu_capacity_gb must be positive, got {self.connector_cpu_capacity_gb}"
         )
     if self.connector_chunk_size <= 0:
         raise ValueError(

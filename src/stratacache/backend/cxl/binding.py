@@ -13,28 +13,20 @@ def _load_lib() -> ctypes.CDLL:
     """
     Locate and load libcxl_shm.so.
 
-    Search order (best-effort):
-      - `STRATACACHE_CXL_LIB` env var
-      - repo root (../../../../../libcxl_shm.so relative to this file)
-      - current working directory
-      - system loader path
+    Default location is stratacache/csrc/cxl/libcxl_shm.so (produced by
+    `make` in that directory). The CWD and the loader path are tried as
+    fallbacks so a hand-installed system copy still works.
     """
-    env_path = os.getenv("STRATACACHE_CXL_LIB")
-    candidates = []
-    if env_path:
-        candidates.append(env_path)
-
-    # This file: stratacache/src/stratacache/backend/cxl/binding.py
     here = os.path.dirname(__file__)
-    repo_root_guess = os.path.abspath(os.path.join(here, "..", "..", "..", "..", "..", ".."))
-    candidates.extend(
-        [
-            os.path.join(repo_root_guess, "libcxl_shm.so"),
-            os.path.join(os.getcwd(), "libcxl_shm.so"),
-            "./libcxl_shm.so",
-            "libcxl_shm.so",
-        ]
+    csrc_lib = os.path.abspath(
+        os.path.join(here, "..", "..", "..", "..", "csrc", "cxl", "libcxl_shm.so")
     )
+    candidates = [
+        csrc_lib,
+        os.path.join(os.getcwd(), "libcxl_shm.so"),
+        "./libcxl_shm.so",
+        "libcxl_shm.so",
+    ]
 
     last_err: Optional[OSError] = None
     for p in candidates:

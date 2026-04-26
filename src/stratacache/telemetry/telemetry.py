@@ -99,6 +99,7 @@ class StrataTelemetry:
         self._per_tier_telemetry: dict[StrataTierType, StrataTierTelemetry] = {}
         self._message_queue = queue.Queue()
         self._last_tick = 0
+        self._exporter_server = None  # set when uvicorn is started
 
         self._initialize_backends()
 
@@ -108,6 +109,9 @@ class StrataTelemetry:
         if config.get_config().telemetry_export:
             self._exporter = threading.Thread(target=self._export_server, daemon=True)
             self._exporter.start()
+            import atexit
+
+            atexit.register(self._shutdown_export_server)
 
     _instance = None
     _instance_lock = threading.Lock()
@@ -349,4 +353,33 @@ class StrataTelemetry:
         from stratacache.telemetry.metrics import app
         import uvicorn
 
-        uvicorn.run(app, host="0.0.0.0", port=6954)
+        # IMPORTANT: install_signal_handlers=False so uvicorn does NOT
+        # intercept SIGINT/SIGTERM. With its default config it grabs both
+        # signals on whichever thread it lives in and starts a graceful
+        # shutdown that waits for active connections to drain - if a
+        # Prometheus scraper keeps polling /metrics, the process never
+        # exits. Letting signals reach the host process means Ctrl+C on
+        # vLLM kills the engine-core children cleanly.
+        config_obj = uvicorn.Config(
+            app,
+            host="0.0.0.0",
+            port=6954,
+            log_level="warning",
+            access_log=False,
+        )
+        server = uvicorn.Server(config_obj)
+        server.install_signal_handlers = lambda: None  # type: ignore[assignment]
+        self._exporter_server = server
+        try:
+            server.run()
+        except Exception:  # noqa: BLE001
+            logger.exception("StrataCache telemetry exporter crashed")
+
+    def _shutdown_export_server(self) -> None:
+        srv = self._exporter_server
+        if srv is None:
+            return
+        try:
+            srv.should_exit = True
+        except Exception:  # noqa: BLE001
+            pass

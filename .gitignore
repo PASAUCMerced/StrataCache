@@ -222,3 +222,6 @@ wandb/
 CMakeFiles/
 CMakeCache.txt
 cmake_install.cmake
+# StrataCache project ignores
+tmp/
+*.o

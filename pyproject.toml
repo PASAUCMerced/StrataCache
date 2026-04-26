@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68", "wheel", "pybind11"]
+requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,16 +8,21 @@ version = "0.2.0"
 description = "Standalone tiered artifact cache with CPU+CXL backends and write-through/write-back links."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "Apache-2.0" }
+license = "Apache-2.0"
 authors = [{ name = "StrataCache Contributors" }]
 dependencies = [
     "PyYAML>=6.0",
     "vllm==0.13.0",
     "psutil>=5.9.0",
-    "wandb>=0.15.0",
-    "pybind11>=2.6.0",
-    "cupti-python==12.8.0",
+    "sortedcontainers>=2.4",
 ]
+
+[project.optional-dependencies]
+# Telemetry exporters and GPU/PCM tooling are off the critical path; opt
+# in only when needed.
+telemetry = ["wandb>=0.15.0"]
+gpu-telemetry = ["cupti-python==12.8.0"]
+pcm = ["pybind11>=2.6.0"]
 
 [tool.setuptools]
 package-dir = {"" = "src"}

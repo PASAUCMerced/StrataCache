@@ -12,8 +12,8 @@ Design intent (this phase):
 - Keep two concrete implementations:
   * BytesMemoryObj: thin wrapper around Python bytes. Used to keep the CPU
     OrderedDict backend working with no copy-format change.
-  * TensorMemoryObj: wraps a torch tensor (pinned or device). Lays the
-    groundwork for the LMCache-style zero-copy path.
+  * TensorMemoryObj: wraps a torch tensor (pinned or device). Backs the
+    zero-copy slab path.
 - Reserve, but do NOT yet implement, ref-count / pin / auto-free hooks.
   Those land together with the slab allocator in a later phase
   (see tmp/lmcache_gap_analysis.md, B1-B3).
@@ -48,9 +48,12 @@ class MemoryObjMetadata:
     # None when the buffer is opaque bytes (e.g. an opaque CXL frame).
     dtype: Optional[str] = None
     shape: Optional[tuple[int, ...]] = None
-    # Reserved for B3 ref-count / pin protocol. Implementations may ignore
-    # these for now; the fields exist so callers can be written against the
-    # final shape.
+    # B3 ref-count / pin protocol.
+    # ref_count = 1 at construction (the storage layer holds one ref).
+    # Increments when consumers borrow the object via get_blocking-style
+    # paths; reaches 0 only after the layer has dropped its ref AND every
+    # borrower has released theirs. pin_count tracks lookup-pins that
+    # forbid eviction even when ref_count > 1.
     ref_count: int = 1
     pin_count: int = 0
 
@@ -96,9 +99,7 @@ class MemoryObj(ABC):
         """Logical payload size in bytes (replaces `len(payload)`)."""
         return self.metadata.size
 
-    # -- Reserved for the B3 ref-count / pin protocol -----------------------
-    # These are intentional no-ops at this phase so call sites can be written
-    # against the final API shape. They will become real once allocators land.
+    # -- B3 ref-count / pin protocol ----------------------------------------
 
     def ref_count_up(self) -> None:
         self.metadata.ref_count += 1
@@ -106,6 +107,8 @@ class MemoryObj(ABC):
     def ref_count_down(self) -> None:
         if self.metadata.ref_count > 0:
             self.metadata.ref_count -= 1
+        if self.metadata.ref_count == 0 and self.metadata.pin_count == 0:
+            self._on_release()
 
     def pin(self) -> None:
         self.metadata.pin_count += 1
@@ -113,9 +116,24 @@ class MemoryObj(ABC):
     def unpin(self) -> None:
         if self.metadata.pin_count > 0:
             self.metadata.pin_count -= 1
+        if self.metadata.ref_count == 0 and self.metadata.pin_count == 0:
+            self._on_release()
 
     def can_evict(self) -> bool:
+        """
+        True iff the object is not pinned AND only the storage layer holds
+        a reference (ref_count <= 1).
+        """
         return self.metadata.pin_count == 0 and self.metadata.ref_count <= 1
+
+    def _on_release(self) -> None:
+        """
+        Hook fired when ref_count and pin_count both reach 0.
+
+        Default: no-op (BytesMemoryObj relies on Python GC). TensorMemoryObj
+        with an allocator-backed slot overrides this to free the slot.
+        """
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -127,9 +145,9 @@ class BytesMemoryObj(MemoryObj):
     """
     Trivial MemoryObj backed by a Python bytes object.
 
-    Used by the CPU backend during the migration phase; also used by the CXL
-    backend's read path (decode_record returns bytes). Carries no
-    dtype/shape information by default.
+    Used by the CPU backend during the migration phase; also returned by
+    the CXL backend's read path when the caller did not supply a
+    dtype/shape hint. Carries no dtype/shape information by default.
     """
 
     __slots__ = ("_buf", "_meta")
@@ -159,15 +177,27 @@ class TensorMemoryObj(MemoryObj):
     MemoryObj backed by a torch.Tensor.
 
     The tensor's underlying storage may be:
-    - a pageable CPU tensor (today, simple case)
-    - a pinned host tensor (after we wire B1+B2)
+    - a pageable CPU tensor (simple case)
+    - a pinned host tensor (when produced by a slab allocator with
+      pin_memory=True)
     - a device tensor (when used as an in-flight GPU buffer)
+
+    `release_callback`, when provided, is invoked exactly once when the
+    object's ref_count and pin_count both reach 0. Slab-backed factories
+    use this to return the slot to the allocator without the core layer
+    needing to know about allocator types.
 
     `byte_array` materializes by viewing as uint8 then `.tobytes()`. Avoid
     using it on the hot path; prefer `.tensor` for zero-copy consumers.
     """
 
-    __slots__ = ("_t", "_meta")
+    __slots__ = (
+        "_t",
+        "_meta",
+        "_release_cb",
+        "_released",
+        "_pending_event",
+    )
 
     def __init__(
         self,
@@ -177,8 +207,14 @@ class TensorMemoryObj(MemoryObj):
         size: Optional[int] = None,
         dtype: Optional[str] = None,
         shape: Optional[tuple[int, ...]] = None,
+        release_callback: Optional[Any] = None,  # Callable[[], None]
     ) -> None:
         self._t = tensor
+        # Optional CUDA event recorded by producers of pending D2H copies.
+        # Consumers that need host-visible bytes (or want to chain an H2D
+        # back to GPU) call `wait_pending()` first - cheap when the copy
+        # has already drained, avoids the host-block in the producer path.
+        self._pending_event: Any = None
         # Compute size lazily-but-eagerly so backends can account for it
         # without importing torch.
         if size is None:
@@ -193,6 +229,8 @@ class TensorMemoryObj(MemoryObj):
             dtype=dtype,
             shape=shape,
         )
+        self._release_cb = release_callback
+        self._released = False
 
     @property
     def metadata(self) -> MemoryObjMetadata:
@@ -202,15 +240,65 @@ class TensorMemoryObj(MemoryObj):
     def tensor(self) -> Any:
         return self._t
 
+    def wait_pending_on_stream(self, stream: Any = None) -> None:
+        """
+        GPU-side wait: makes `stream` (current stream by default) wait for
+        the producer's pending copy event. NOT host-blocking. Safe to
+        call repeatedly; doesn't clear the event so other consumers can
+        also wait.
+
+        Use this when the consumer immediately issues another GPU op that
+        reads the buffer (e.g. an H2D copy back to GPU). Cheap when the
+        producer ran on the same stream - in that case it's effectively
+        a no-op.
+        """
+        ev = self._pending_event
+        if ev is None:
+            return
+        try:
+            ev.wait(stream)
+        except TypeError:
+            # Older torch: wait() takes no args; just no-op host wait.
+            ev.wait()
+
+    def wait_pending_on_host(self) -> None:
+        """
+        Host-blocking wait. Use only when the consumer is going to read
+        the underlying memory from CPU (e.g. byte_array, CXL serialize).
+        Clears the event after waiting.
+        """
+        ev = self._pending_event
+        if ev is not None:
+            ev.synchronize()
+            self._pending_event = None
+
+    def attach_pending_event(self, event: Any) -> None:
+        """Producer-side hook to register a CUDA event."""
+        self._pending_event = event
+
     @property
     def byte_array(self) -> bytes:
         # Lazy import keeps core dependency-free when torch isn't installed.
         import torch  # type: ignore[import-not-found]
 
+        # CPU-side read: must drain any pending D2H from the producer.
+        self.wait_pending_on_host()
         t = self._t.detach().contiguous()
         if t.device.type != "cpu":
             t = t.cpu()
         return t.view(torch.uint8).numpy().tobytes(order="C")
+
+    def _on_release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        cb = self._release_cb
+        if cb is not None:
+            try:
+                cb()
+            except Exception:  # noqa: BLE001
+                # Releasing memory must never raise to callers.
+                pass
 
 
 __all__ = [
